@@ -67,7 +67,6 @@ def run() -> int:
         from .app import MainWindow, make_app
 
         engine.PATH_ANCHORS = [3, 10]  # cukup untuk menguji jalur, lebih cepat
-        engine.PREDICT_ASSETS = ["WTI", "BTC"]  # siklus lewat thread cukup dua aset
         store = Store(db_path())
         _synthetic(store)
         # Tanpa jalur dulu: meniru database dari versi sebelumnya (pernah bikin crash saat dibuka).
@@ -91,15 +90,16 @@ def run() -> int:
                     app.processEvents()
         print("smoke: semua tampilan tergambar", flush=True)
 
-        # Jalankan siklus lewat thread seperti saat aplikasi dibuka (tanpa internet).
+        # Jalankan siklus lewat proses latar seperti saat aplikasi dibuka (tanpa internet).
         import time
+        win.cycle_extra_args = ["--asset", "WTI", "--asset", "BTC", "--path-anchors", "3,10"]
         win.start_cycle(fetch=False)
         deadline = time.monotonic() + 600
-        while win._thread is not None and time.monotonic() < deadline:
+        while win.cycle_running and time.monotonic() < deadline:
             app.processEvents()
             time.sleep(0.05)
         app.processEvents()
-        if win._thread is not None:
+        if win.cycle_running:
             print("smoke: siklus tidak selesai dalam 10 menit", flush=True)
             return 1
         status = win.status.text()

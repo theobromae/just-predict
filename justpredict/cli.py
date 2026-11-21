@@ -23,6 +23,11 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("gui", help="Buka aplikasi desktop")
     sub.add_parser("selftest", help="Uji cepat tanpa internet (dipakai CI setelah build)")
     sub.add_parser("gui-smoke", help="Buka jendela dengan data sintetis lalu tutup (dipakai CI)")
+    # Proses latar untuk GUI: siklus berjalan di proses terpisah berprioritas rendah agar grafik tetap mulus.
+    worker = sub.add_parser("worker", help=argparse.SUPPRESS)
+    worker.add_argument("--no-fetch", action="store_true")
+    worker.add_argument("--asset", action="append")
+    worker.add_argument("--path-anchors", help=argparse.SUPPRESS)
     argv = list(sys.argv[1:] if argv is None else argv)
     # macOS kadang menambahkan argumen seperti "-psn_0_12345" saat aplikasi dibuka dari Finder.
     # Abaikan semua argumen yang tidak dikenal agar aplikasi tidak langsung keluar.
@@ -49,6 +54,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "selftest":
         return selftest()
+    if args.cmd == "worker":
+        return worker_main(args)
 
     store = Store(db_path())
     try:
@@ -61,6 +68,29 @@ def main(argv: list[str] | None = None) -> int:
             print(latest_table(store).drop(columns=["asset_key", "horizon_days"], errors="ignore"))
             print("\n== Akurasi ==")
             print(accuracy_table(store))
+    finally:
+        store.close()
+    return 0
+
+
+def worker_main(args) -> int:
+    """Siklus untuk GUI. Baris keluaran: "P<TAB>pesan" (kemajuan), "R<TAB>{json}" (hasil)."""
+    import json
+    import os
+    from dataclasses import asdict
+
+    from . import engine
+    try:
+        os.nice(10)  # beri prioritas ke jendela aplikasi
+    except (AttributeError, OSError):
+        pass
+    if args.path_anchors:
+        engine.PATH_ANCHORS = [int(x) for x in args.path_anchors.split(",")]
+    store = Store(db_path())
+    try:
+        rep = run_cycle(store, fetch=not args.no_fetch, assets=args.asset,
+                        progress=lambda m: print(f"P\t{m}", flush=True))
+        print("R\t" + json.dumps(asdict(rep)), flush=True)
     finally:
         store.close()
     return 0

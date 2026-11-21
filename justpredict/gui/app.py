@@ -13,7 +13,7 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import pyqtgraph as pg
-from PySide6.QtCore import QObject, QPointF, QRectF, QSettings, Qt, QThread, Signal
+from PySide6.QtCore import QPointF, QProcess, QProcessEnvironment, QRectF, QSettings, Qt
 from PySide6.QtGui import QAction, QColor, QGuiApplication, QPainter, QPalette, QPicture
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QFrame, QGridLayout, QHBoxLayout, QLabel, QListWidget,
@@ -47,7 +47,9 @@ RELIABILITY_COLORS = {0: FAINT, 1: AMBER, 2: SKY, 3: UP}
 TREND_COLORS = {2: UP, 1: UP, 0: NEUTRAL, -1: DOWN, -2: DOWN}
 DISCLAIMER = "Prediksi bisa salah dan bukan saran investasi. Gunakan sebagai bahan pertimbangan."
 
-pg.setConfigOptions(antialias=True, background=BG, foreground=MUTED)
+# Antialiasing global dimatikan (grid, sumbu, candle, batang volume tidak butuh); garis harga dan
+# prediksi menyalakannya sendiri. Ini membuat geser/zoom grafik jauh lebih ringan.
+pg.setConfigOptions(antialias=False, background=BG, foreground=MUTED)
 
 STYLE = f"""
 * {{ color: {TEXT}; font-size: 13px; }}
@@ -174,51 +176,48 @@ class VolumeAxis(pg.AxisItem):
 
 
 class CandlestickItem(pg.GraphicsObject):
-    """Candle: badan = buka→tutup, sumbu = tertinggi→terendah. Hijau naik, merah turun."""
+    """Candle: badan = buka→tutup, sumbu = tertinggi→terendah. Hijau naik, merah turun.
+
+    Digambar per potongan (CHUNK batang) dan hanya potongan yang terlihat yang dilukis, sehingga
+    menggeser grafik dengan riwayat panjang tetap ringan.
+    """
+
+    CHUNK = 150
 
     def __init__(self, x, o, h, l, c, width):
         super().__init__()
-        self._picture = QPicture()
-        p = QPainter(self._picture)
-        for xi, oi, hi, li, ci in zip(x, o, h, l, c):
-            color = QColor(UP if ci >= oi else DOWN)
-            p.setPen(pg.mkPen(color, width=1))
-            p.drawLine(QPointF(xi, li), QPointF(xi, hi))
-            p.setBrush(pg.mkBrush(color))
-            top, bottom = max(oi, ci), min(oi, ci)
-            if top == bottom:
-                p.drawLine(QPointF(xi - width / 2, top), QPointF(xi + width / 2, top))
-            else:
-                p.drawRect(QRectF(xi - width / 2, bottom, width, top - bottom))
-        p.end()
-        self._bounds = (QRectF(min(x) - width, min(l), max(x) - min(x) + 2 * width, max(h) - min(l))
+        x, o, h, l, c = (np.asarray(v, dtype=float) for v in (x, o, h, l, c))
+        self._chunks: list[tuple[float, float, QPicture]] = []
+        up_pen, dn_pen = pg.mkPen(UP, width=1), pg.mkPen(DOWN, width=1)
+        up_br, dn_br = pg.mkBrush(UP), pg.mkBrush(DOWN)
+        for start in range(0, len(x), self.CHUNK):
+            sl = slice(start, start + self.CHUNK)
+            pic = QPicture()
+            p = QPainter(pic)
+            for xi, oi, hi, li, ci in zip(x[sl], o[sl], h[sl], l[sl], c[sl]):
+                up = ci >= oi
+                p.setPen(up_pen if up else dn_pen)
+                p.drawLine(QPointF(xi, li), QPointF(xi, hi))
+                p.setBrush(up_br if up else dn_br)
+                top, bottom = max(oi, ci), min(oi, ci)
+                if top == bottom:
+                    p.drawLine(QPointF(xi - width / 2, top), QPointF(xi + width / 2, top))
+                else:
+                    p.drawRect(QRectF(xi - width / 2, bottom, width, top - bottom))
+            p.end()
+            self._chunks.append((float(x[sl][0]) - width, float(x[sl][-1]) + width, pic))
+        self._bounds = (QRectF(x.min() - width, l.min(), x.max() - x.min() + 2 * width, h.max() - l.min())
                         if len(x) else QRectF())
 
-    def paint(self, painter, *args):
-        painter.drawPicture(0, 0, self._picture)
+    def paint(self, painter, option, *args):
+        vb = self.getViewBox()
+        lo, hi = vb.viewRange()[0] if vb is not None else (-np.inf, np.inf)
+        for a, b, pic in self._chunks:
+            if b >= lo and a <= hi:
+                painter.drawPicture(0, 0, pic)
 
     def boundingRect(self):
         return self._bounds
-
-
-# ---------------------------------------------------------------- worker
-class CycleWorker(QObject):
-    progress = Signal(str)
-    finished = Signal(object)
-    failed = Signal(str)
-
-    def __init__(self, fetch: bool = True):
-        super().__init__()
-        self.fetch = fetch
-
-    def run(self):
-        store = Store(db_path())  # koneksi SQLite terpisah untuk thread ini
-        try:
-            self.finished.emit(run_cycle(store, fetch=self.fetch, progress=self.progress.emit))
-        except Exception:
-            self.failed.emit(traceback.format_exc())
-        finally:
-            store.close()
 
 
 # ---------------------------------------------------------------- kartu panel kanan
@@ -322,7 +321,8 @@ class MainWindow(QMainWindow):
         import os
         # Folder data khusus (tes/CI) memakai pengaturan terpisah agar pilihan pengguna tidak tertimpa.
         self.settings = QSettings("JustPredict", "JustPredict-test" if os.environ.get("JUSTPREDICT_HOME") else "JustPredict")
-        self._thread: QThread | None = None
+        self._proc: QProcess | None = None
+        self.cycle_extra_args: list[str] = []  # argumen tambahan untuk proses siklus (dipakai uji CI)
         self._cd = pd.DataFrame()
         self._x = np.array([])
         self._trend_open = self.settings.value("trend_details_open", False, type=bool)
@@ -383,6 +383,9 @@ class MainWindow(QMainWindow):
         self.hover = QLabel(" ")
         self.hover.setObjectName("muted")
         self.hover.setTextFormat(Qt.RichText)
+        # Ukuran tetap: teks yang berubah saat mouse bergerak tidak memicu tata letak ulang jendela.
+        self.hover.setFixedHeight(20)
+        self.hover.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         center.addWidget(self.hover)
 
         self.price_plot = pg.PlotWidget(axisItems={"bottom": DateAxis(orientation="bottom")})
@@ -393,7 +396,9 @@ class MainWindow(QMainWindow):
             p.setMaximumHeight(130)
             p.setMouseEnabled(y=False)
         for p in (self.price_plot, self.vol_plot, self.rsi_plot):
-            p.showGrid(x=True, y=True, alpha=0.08)
+            # Grid horizontal saja, di garis utama: grid penuh adalah bagian termahal saat grafik digeser.
+            p.showGrid(x=False, y=True, alpha=0.08)
+            p.getAxis("left").setStyle(maxTickLevel=0)
             p.getAxis("left").setWidth(72)
             for ax in ("left", "bottom"):
                 p.getAxis(ax).setPen(pg.mkPen(BORDER))
@@ -435,7 +440,12 @@ class MainWindow(QMainWindow):
         plots.addWidget(self.rsi_plot, 1)
         chart_row.addLayout(plots, 1)
         center.addLayout(chart_row, 1)
-        self.price_plot.scene().sigMouseMoved.connect(self._on_mouse)
+        # Info harga di bawah kursor diperbarui maks. 30×/detik.
+        self._mouse_proxy = pg.SignalProxy(self.price_plot.scene().sigMouseMoved, rateLimit=30,
+                                           slot=lambda ev: self._on_mouse(ev[0]))
+        for p in (self.price_plot, self.vol_plot, self.rsi_plot):
+            p.plotItem.setClipToView(True)  # hanya data yang terlihat yang diproses
+            p.plotItem.setDownsampling(auto=True, mode="peak")
         self.drawings = DrawingLayer(self.price_plot, self.store)
         self.tool_group.buttonToggled.connect(
             lambda b, on: on and self.drawings.tool != b.property("key") and self.drawings.set_tool(b.property("key")))
@@ -581,40 +591,90 @@ class MainWindow(QMainWindow):
             self.refresh_asset_list(select=self.current_asset())
 
     # ------------------------------------------------------------ siklus
+    @property
+    def cycle_running(self) -> bool:
+        return self._proc is not None
+
+    @staticmethod
+    def _worker_command() -> tuple[str, list[str]]:
+        if getattr(sys, "frozen", False):  # aplikasi hasil build: jalankan dirinya sendiri
+            return sys.executable, ["worker"]
+        return sys.executable, ["-m", "justpredict", "worker"]
+
     def start_cycle(self, fetch: bool):
-        if self._thread is not None:
+        """Update data + latih ulang di PROSES terpisah berprioritas rendah, agar grafik tetap mulus."""
+        if self._proc is not None:
             return
         self.refresh_btn.setEnabled(False)
         self.status.setText("Memperbarui data dan melatih model… grafik diperbarui otomatis setelah selesai.")
-        self._thread = QThread(self)
-        self._worker = CycleWorker(fetch)
-        self._worker.moveToThread(self._thread)
-        self._thread.started.connect(self._worker.run)
-        self._worker.progress.connect(self._on_progress)
-        self._worker.finished.connect(self._on_finished)
-        self._worker.failed.connect(self._on_failed)
-        self._thread.start()
+        prog, args = self._worker_command()
+        args = args + ([] if fetch else ["--no-fetch"]) + self.cycle_extra_args
+        proc = QProcess(self)
+        env = QProcessEnvironment.systemEnvironment()
+        if not getattr(sys, "frozen", False):
+            import os
+            pkg_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            env.insert("PYTHONPATH", pkg_root + os.pathsep + env.value("PYTHONPATH", ""))
+        proc.setProcessEnvironment(env)
+        self._out_buf, self._err_tail, self._report = "", [], None
+        proc.readyReadStandardOutput.connect(self._on_proc_stdout)
+        proc.readyReadStandardError.connect(self._on_proc_stderr)
+        proc.finished.connect(self._on_proc_finished)
+        proc.errorOccurred.connect(self._on_proc_error)
+        self._proc = proc
+        proc.start(prog, args)
 
-    def _cleanup_thread(self):
-        self._thread.quit()
-        self._thread.wait()
-        self._thread = None
+    def _on_proc_stdout(self):
+        import json
+        self._out_buf += bytes(self._proc.readAllStandardOutput()).decode("utf-8", "replace")
+        *lines, self._out_buf = self._out_buf.split("\n")
+        for line in lines:
+            kind, _, body = line.rstrip("\r").partition("\t")
+            if kind == "P":
+                self._on_progress(body)
+            elif kind == "R":
+                try:
+                    self._report = json.loads(body)
+                except ValueError:
+                    self.log.appendPlainText(line)
+            elif line.strip():
+                self.log.appendPlainText(line)
+
+    def _on_proc_stderr(self):
+        text = bytes(self._proc.readAllStandardError()).decode("utf-8", "replace")
+        self._err_tail = (self._err_tail + text.splitlines())[-60:]
+
+    def _on_proc_error(self, err):
+        if err == QProcess.FailedToStart and self._proc is not None:
+            self._proc = None
+            self.refresh_btn.setEnabled(True)
+            self._on_failed("Proses pembaruan gagal dijalankan.")
+
+    def _on_proc_finished(self, code, status):
+        if self._proc is None:
+            return
+        self._on_proc_stdout()
+        self._proc.deleteLater()
+        self._proc = None
         self.refresh_btn.setEnabled(True)
+        if self._report is not None:
+            self._on_finished(self._report)
+        else:
+            self._on_failed(f"Proses pembaruan berhenti (kode {code}).\n" + "\n".join(self._err_tail))
 
     def _on_progress(self, msg: str):
         self.status.setText(msg)
         self.log.appendPlainText(msg)
 
-    def _on_finished(self, rep):
-        self._cleanup_thread()
-        msg = (f"Data terbaru sudah masuk. {rep.evaluated} prediksi lama dicek, "
-               f"{rep.predicted} prediksi baru dibuat.")
+    def _on_finished(self, rep: dict):
+        msg = (f"Data terbaru sudah masuk. {rep.get('evaluated', 0)} prediksi lama dicek, "
+               f"{rep.get('predicted', 0)} prediksi baru dibuat.")
         self.status.setText(msg)
-        self.log.appendPlainText(msg + (f" Dilewati: {', '.join(rep.skipped)}" if rep.skipped else ""))
+        skipped = rep.get("skipped") or []
+        self.log.appendPlainText(msg + (f" Dilewati: {', '.join(skipped)}" if skipped else ""))
         self.refresh_asset_list(select=self.current_asset())
 
     def _on_failed(self, tb: str):
-        self._cleanup_thread()
         self.status.setText("Terjadi kesalahan saat memperbarui. Klik 'Lihat log' untuk detail.")
         self.log.appendPlainText(tb)
 
@@ -692,11 +752,14 @@ class MainWindow(QMainWindow):
             self.price_plot.plot([], [], pen=None, symbol="s", symbolSize=8, symbolBrush=UP, symbolPen=None,
                                  name=f"Harga ({tf.label.lower()})")
         else:
-            self.price_plot.plot(x, cd.close.values, pen=pg.mkPen(SKY, width=2), name=f"Harga ({tf.label.lower()})")
+            self.price_plot.plot(x, cd.close.values, pen=pg.mkPen(SKY, width=2), name=f"Harga ({tf.label.lower()})",
+                                 antialias=True)
 
         if self.cb_ma.isChecked():
-            self.price_plot.plot(x, cd.ma20.values, pen=pg.mkPen(AMBER, width=1.4), name="MA 20", connect="finite")
-            self.price_plot.plot(x, cd.ma50.values, pen=pg.mkPen("#a78bfa", width=1.4), name="MA 50", connect="finite")
+            self.price_plot.plot(x, cd.ma20.values, pen=pg.mkPen(AMBER, width=1.4), name="MA 20", connect="finite",
+                                 antialias=True)
+            self.price_plot.plot(x, cd.ma50.values, pen=pg.mkPen("#a78bfa", width=1.4), name="MA 50", connect="finite",
+                                 antialias=True)
 
         # ---- support / resistance
         if self.cb_sr.isChecked() and s.ta:
@@ -770,7 +833,7 @@ class MainWindow(QMainWindow):
             lo = self.price_plot.plot(px, np.r_[base, path.lo.values], pen=pg.mkPen(ACCENT + "88", width=1))
             hi = self.price_plot.plot(px, np.r_[base, path.hi.values], pen=pg.mkPen(ACCENT + "88", width=1))
             self.price_plot.addItem(pg.FillBetweenItem(lo, hi, brush=pg.mkBrush(139, 92, 246, 45)))
-            self.price_plot.plot(px, np.r_[base, path.mid.values], pen=pg.mkPen(ACCENT, width=2.2),
+            self.price_plot.plot(px, np.r_[base, path.mid.values], pen=pg.mkPen(ACCENT, width=2.2), antialias=True,
                                  symbol="o", symbolSize=5, symbolBrush=ACCENT, symbolPen=None,
                                  name=f"Perkiraan {len(path)} titik + rentang 80%")
             end = path.iloc[-1]
@@ -785,9 +848,11 @@ class MainWindow(QMainWindow):
         self.vol_plot.setVisible(self.cb_volume.isChecked() and has_vol)
         if self.cb_volume.isChecked() and has_vol:
             up = (cd.close >= cd.open).values
-            brushes = [pg.mkBrush((UP if u else DOWN) + "aa") for u in up]
-            self.vol_plot.addItem(pg.BarGraphItem(x=x, height=cd.volume.fillna(0).values, width=width,
-                                                  brushes=brushes, pens=[pg.mkPen(None)] * len(x)))
+            vol = cd.volume.fillna(0).values
+            for mask, color in ((up, UP), (~up, DOWN)):  # dua item berwarna tunggal: jauh lebih ringan
+                if mask.any():
+                    self.vol_plot.addItem(pg.BarGraphItem(x=x[mask], height=vol[mask], width=width,
+                                                          brush=pg.mkBrush(color + "aa"), pen=pg.mkPen(None)))
 
         # ---- RSI
         self.rsi_plot.setVisible(self.cb_rsi.isChecked())
@@ -798,7 +863,7 @@ class MainWindow(QMainWindow):
                 self.rsi_plot.addItem(pg.InfiniteLine(lvl, angle=0, pen=pg.mkPen(FAINT, style=Qt.DashLine),
                                                       label=txt, labelOpts={"position": 0.98, "color": FAINT,
                                                                             "anchors": [anchor, anchor]}))
-            self.rsi_plot.plot(x, cd.rsi.values, pen=pg.mkPen(ACCENT, width=1.5), connect="finite")
+            self.rsi_plot.plot(x, cd.rsi.values, pen=pg.mkPen(ACCENT, width=1.5), connect="finite", antialias=True)
             self.rsi_plot.setYRange(0, 100)
 
         # ---- rentang awal: N batang terakhir + area perkiraan
@@ -985,9 +1050,12 @@ class MainWindow(QMainWindow):
             ])
 
     def closeEvent(self, event):
-        if self._thread is not None:
-            self._thread.quit()
-            self._thread.wait(3000)
+        if self._proc is not None:  # hentikan proses latar; data yang sudah tersimpan aman (SQLite)
+            proc, self._proc = self._proc, None
+            proc.terminate()
+            if not proc.waitForFinished(3000):
+                proc.kill()
+                proc.waitForFinished(1000)
         self.store.close()
         super().closeEvent(event)
 
