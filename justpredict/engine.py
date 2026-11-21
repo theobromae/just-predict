@@ -11,6 +11,8 @@ import pandas as pd
 
 from . import adaptive
 from .config import ASSET_BY_KEY, HORIZONS, PREDICT_ASSETS
+from .data.fundamentals import fundamental_features, update_fundamentals
+from .data.news import update_news
 from .data.prices import PriceSource, intraday_local, update_all, update_intraday
 from .db import Store
 from .features import FEATURE_VERSION, build_dataset
@@ -119,6 +121,19 @@ def predict_asset(store: Store, asset: str, horizon: int, model_names: list[str]
     base_price = float(close.loc[base_date])
     base_str = base_date.strftime("%Y-%m-%d")
 
+    # Fitur fundamental hanya dipakai kalau di uji data lama membuat LightGBM lebih baik.
+    use_extra = False
+    if extra_features is not None and not extra_features.empty and "x_" in "".join(X.columns):
+        base_cols = [c for c in X.columns if not c.startswith("x_")]
+        with_x = _backtest(LightGBMForecaster, X, y, horizon)
+        without = _backtest(LightGBMForecaster, X[base_cols], y, horizon)
+        if with_x and without:
+            store.save_backtest(asset, horizon, "lightgbm_fund", **with_x)
+            store.save_backtest(asset, horizon, "lightgbm_base", **without)
+            use_extra = with_x["hit_rate"] >= without["hit_rate"] and with_x["mae_ret"] <= without["mae_ret"]
+        if not use_extra:
+            X, X_latest = X[base_cols], X_latest[base_cols]
+
     models = make_models(model_names)
     member_preds: dict[str, pd.Series] = {}
     backtest_mae: dict[str, float] = {}
@@ -153,7 +168,8 @@ def predict_asset(store: Store, asset: str, horizon: int, model_names: list[str]
         p_up=float(np.clip(final.p_up, 0, 1)), q10=float(final.q10), q50=float(final.q50),
         q90=float(final.q90), raw_q50=float(combined.q50),
         model_version=(f"ensemble-{ENGINE_VERSION} w=" + ",".join(f"{k}:{v:.2f}" for k, v in weights.items())
-                       + f" bias={correction.bias:+.4f} scale={correction.width_scale:.2f}"),
+                       + f" bias={correction.bias:+.4f} scale={correction.width_scale:.2f}"
+                       + f" fund={int(use_extra)}"),
     )
     return True
 
@@ -216,7 +232,7 @@ def predict_intraday(store: Store, asset: str, key: str) -> bool:
 def run_cycle(store: Store, source: PriceSource | None = None, fetch: bool = True,
               assets: list[str] | None = None, model_names: list[str] | None = None,
               progress: Callable[[str], None] = lambda m: None, with_path: bool = True,
-              with_intraday: bool = True) -> CycleReport:
+              with_intraday: bool = True, with_fundamentals: bool = True) -> CycleReport:
     report = CycleReport()
     if fetch:
         report.updated = update_all(store, source, progress)
@@ -224,13 +240,25 @@ def run_cycle(store: Store, source: PriceSource | None = None, fetch: bool = Tru
             update_intraday(store, source, progress)
         except Exception:
             log.exception("Gagal memperbarui data per jam")
+        # Sumber harga palsu (tes) tanpa method fundamental/berita dilewati; None = sumber internet.
+        if with_fundamentals and (source is None or hasattr(source, "statements")):
+            try:
+                update_fundamentals(store, source, progress)
+            except Exception:
+                log.exception("Gagal memperbarui data fundamental")
+        if source is None or hasattr(source, "fetch_news"):
+            try:
+                update_news(store, source, assets or None, progress)
+            except Exception:
+                log.exception("Gagal memperbarui berita")
     progress("Mengevaluasi prediksi sebelumnya…")
     report.evaluated = evaluate_matured(store)
     for asset in assets or PREDICT_ASSETS:
         for label, h in HORIZONS.items():
             progress(f"Melatih model {ASSET_BY_KEY[asset].name} ({label})…")
             try:
-                ok = predict_asset(store, asset, h, model_names)
+                extra = fundamental_features(store, asset) if with_fundamentals else None
+                ok = predict_asset(store, asset, h, model_names, extra)
             except Exception as exc:
                 log.exception("Gagal memprediksi %s h=%s", asset, h)
                 progress(f"Gagal memprediksi {asset} ({label}): {exc}")

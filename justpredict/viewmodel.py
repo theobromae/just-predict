@@ -12,6 +12,8 @@ import pandas as pd
 
 from .config import ASSET_BY_KEY, HORIZONS
 from .db import Store
+from .data.fundamentals import Assessment, assess, report_dates
+from .data.news import Sentiment, assess_sentiment
 from .data.prices import intraday_local, local_tz
 from .engine import INTRADAY, PATH_POINTS, intraday_model
 from .features import _rsi
@@ -127,7 +129,12 @@ class Summary:
     ta: TAResult | None = None
     trend: str = "Sideways"
     trend_level: int = 0         # +2 bullish, +1 cenderung bullish, 0, -1, -2 bearish
-    trend_details: list[tuple[str, str]] = field(default_factory=list)  # rincian skor: (teks, poin)
+    # Rincian skor Arah Tren: (jenis, teks, poin). jenis: "head", "item", "link", "note", "total".
+    trend_details: list[tuple[str, str, str]] = field(default_factory=list)
+    fundamental: Assessment | None = None
+    sentiment: Sentiment | None = None
+    fund_used: str = ""          # penjelasan apakah fundamental ikut dipakai model
+    reports: list[pd.Timestamp] = field(default_factory=list)  # perkiraan tanggal terbit laporan keuangan
 
 
 def _lean(p_up: float) -> str:
@@ -233,10 +240,16 @@ def _pts(v: int) -> str:
     return f"{v:+d}" if v else "0"
 
 
-def _trend(path: pd.DataFrame, ta: TAResult | None) -> tuple[str, int, str, list[tuple[str, str]]]:
-    """Arah tren = arah model + arah analisis teknikal, beserta rincian skornya."""
-    details: list[tuple[str, str]] = []
+def _trend(path: pd.DataFrame, ta: TAResult | None, fund: Assessment | None = None,
+           senti: Sentiment | None = None, fund_used: str = "") -> tuple[str, int, str, list[tuple[str, str, str]]]:
+    """Arah tren = model ML + analisis teknikal + fundamental/makro + sentimen berita.
+
+    Setiap kelompok menyumbang +1 (naik), 0, atau −1 (turun). Total −4..+4 menentukan label.
+    """
+    d: list[tuple[str, str, str]] = []
+    # 1. Model ML
     model_dir = 0
+    d.append(("head", "Model ML", ""))
     if not path.empty:
         end = path.iloc[-1]
         chg = end["mid"] / path.attrs["base_price"] - 1
@@ -244,29 +257,66 @@ def _trend(path: pd.DataFrame, ta: TAResult | None) -> tuple[str, int, str, list
             model_dir = 1
         elif end.p_up <= 0.45 and chg < 0:
             model_dir = -1
-        details.append((f"Model ML: titik terakhir {'▲' if chg > 0 else '▼'} {dec(abs(chg) * 100)}%, "
-                        f"peluang naik {pct(end.p_up)}", _pts(model_dir)))
+        d.append(("item", f"Titik terakhir {'▲' if chg > 0 else '▼'} {dec(abs(chg) * 100)}%, "
+                          f"peluang naik {pct(end.p_up)}", _pts(model_dir)))
     else:
-        details.append(("Model ML: belum ada prediksi", "0"))
+        d.append(("item", "Belum ada prediksi", "0"))
+    if fund_used:
+        d.append(("note", fund_used, ""))
+    # 2. Teknikal
     score = ta.score if ta else 0
-    for sig in (ta.signals if ta else []):
-        details.append((sig.text, _pts(sig.direction)))
     ta_dir = 1 if score >= 2 else -1 if score <= -2 else 0
-    details.append((f"Total skor teknikal {score:+d} → {WORD[ta_dir]}", _pts(ta_dir)))
-    total = model_dir + ta_dir
-    label = {2: "Bullish", 1: "Cenderung bullish", 0: "Sideways", -1: "Cenderung bearish", -2: "Bearish"}[total]
-    if model_dir and ta_dir and model_dir != ta_dir:
-        label = "Belum jelas"
-    details.append((f"Arah tren (model + teknikal) = {label}", _pts(total if label != "Belum jelas" else 0)))
-    why = f"Model: {WORD[model_dir]}. Analisis teknikal: {WORD[ta_dir]} (skor {score:+d})."
-    return label, total if label != "Belum jelas" else 0, why, details
+    d.append(("head", f"Teknikal (skor {score:+d})", _pts(ta_dir)))
+    for sig in (ta.signals if ta else []):
+        d.append(("item", sig.text, _pts(sig.direction)))
+    if not ta or not ta.signals:
+        d.append(("item", "Tidak ada sinyal menonjol", "0"))
+    # 3. Fundamental / makro
+    f_dir = fund.direction if fund else 0
+    title = "Fundamental" + (f": {fund.label}" if fund and fund.label else "")
+    d.append(("head", f"{title} (skor {fund.score:+d})" if fund and fund.available else title, _pts(f_dir)))
+    if fund and fund.available:
+        for text, p in fund.items:
+            d.append(("item", text, _pts(p)))
+    else:
+        d.append(("item", "Data fundamental belum tersedia (diambil saat pembaruan)", "0"))
+    for n in (fund.notes if fund else []):
+        d.append(("note", n, ""))
+    # 4. Sentimen berita
+    s_dir = senti.direction if senti else 0
+    if senti and senti.n:
+        d.append(("head", f"Sentimen berita: {senti.mood} ({senti.n} berita, 7 hari)", _pts(s_dir)))
+        for h in senti.headlines:
+            d.append(("link", h["title"] + (f" · {h['source']}" if h.get("source") else ""),
+                      f"{'+' if h['score'] > 0 else '−'}|{h.get('link') or ''}"))
+    else:
+        d.append(("head", "Sentimen berita", "0"))
+        d.append(("item", "Belum ada berita (diambil saat pembaruan)", "0"))
+
+    parts = [model_dir, ta_dir, f_dir, s_dir]
+    total = sum(parts)
+    if total >= 3:
+        label, level = "Bullish", 2
+    elif total >= 1:
+        label, level = "Cenderung bullish", 1
+    elif total <= -3:
+        label, level = "Bearish", -2
+    elif total <= -1:
+        label, level = "Cenderung bearish", -1
+    else:
+        label, level = ("Belum jelas" if 1 in parts and -1 in parts else "Sideways"), 0
+    d.append(("total", f"Total {total:+d} dari 4 kelompok = {label}", _pts(total)))
+    why = (f"Model: {WORD[model_dir]} · Teknikal: {WORD[ta_dir]} · Fundamental: {WORD[f_dir]} · "
+           f"Sentimen: {WORD[s_dir]}.")
+    return label, level, why, d
 
 
-TREND_RULES = ("Cara hitung: setiap sinyal teknikal bernilai +1 (mendukung naik) atau −1 (mendukung "
-               "turun). Total ≥ +2 dianggap naik, ≤ −2 turun, di antaranya datar. Model ML dihitung "
-               "naik kalau peluang naik ≥ 55% dan perkiraannya naik (turun kalau ≤ 45% dan perkiraannya "
-               "turun). Model dan teknikal sama-sama naik = Bullish, salah satu saja = Cenderung bullish; "
-               "kalau keduanya berlawanan = Belum jelas.")
+TREND_RULES = ("Cara hitung: ada 4 kelompok, masing-masing bernilai +1 (mendukung naik), 0, atau −1 "
+               "(mendukung turun). Model ML +1 kalau peluang naik ≥ 55% dan perkiraannya naik. Teknikal dan "
+               "fundamental: tiap faktor +1/−1, total ≥ +2 berarti +1, ≤ −2 berarti −1. Sentimen: rata-rata "
+               "skor judul berita 7 hari terakhir ≥ +0,15 berarti +1 (minimal 5 berita). Total ≥ +3 = Bullish, "
+               "+1..+2 = Cenderung bullish, 0 = Sideways (atau Belum jelas kalau ada yang berlawanan), "
+               "−1..−2 = Cenderung bearish, ≤ −3 = Bearish.")
 
 
 def _horizon_text(tf: Timeframe) -> str:
@@ -278,6 +328,18 @@ def _horizon_text(tf: Timeframe) -> str:
 def _target(tf: Timeframe, base_date) -> pd.Timestamp:
     b = pd.Timestamp(base_date)
     return b + pd.Timedelta(hours=tf.bar_hours * tf.horizon) if tf.intraday else b + pd.offsets.BDay(tf.horizon)
+
+
+def _fund_used(bt: pd.DataFrame, asset: str, horizon: int) -> str:
+    if bt.empty:
+        return ""
+    sel = bt[(bt.asset == asset) & (bt.horizon == horizon)].set_index("model")
+    if "lightgbm_fund" not in sel.index or "lightgbm_base" not in sel.index:
+        return ""
+    f, b = sel.hit_rate["lightgbm_fund"], sel.hit_rate["lightgbm_base"]
+    if f >= b and sel.mae_ret["lightgbm_fund"] <= sel.mae_ret["lightgbm_base"]:  # aturan sama dengan engine
+        return f"Data fundamental ikut dipakai model (uji data lama: arah benar {pct(f)} vs {pct(b)} tanpa)."
+    return f"Data fundamental tidak dipakai model karena tidak menambah akurasi ({pct(f)} vs {pct(b)} tanpa)."
 
 
 def summarize(store: Store, asset: str, timeframe: str, cd: pd.DataFrame | None = None) -> Summary:
@@ -356,7 +418,16 @@ def summarize(store: Store, asset: str, timeframe: str, cd: pd.DataFrame | None 
 
     s.ta = detect(cd, money=lambda v: money(v, a.currency)) if cd is not None and not cd.empty else None
     s.path = forecast_path(store, asset, s.path_key)
-    s.trend, s.trend_level, s.lines["trend_why"], s.trend_details = _trend(s.path, s.ta)
+    try:
+        s.fundamental = assess(store, asset)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception("Gagal menilai fundamental %s", asset)
+    s.sentiment = assess_sentiment(store, asset)
+    s.reports = report_dates(store, asset)
+    s.fund_used = _fund_used(bt, asset, horizon) if not tf.intraday else ""
+    s.trend, s.trend_level, s.lines["trend_why"], s.trend_details = _trend(
+        s.path, s.ta, s.fundamental, s.sentiment, s.fund_used)
     if not s.path.empty:
         end = s.path.iloc[-1]
         chg = end["mid"] / s.path.attrs["base_price"] - 1

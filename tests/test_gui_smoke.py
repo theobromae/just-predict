@@ -45,6 +45,15 @@ def test_chart_window_all_modes(tmp_path, monkeypatch):
                 win.refresh_chart()
     win.grab().save(str(tmp_path / "shot.png"))
 
+    # Regresi: ganti tampilan dengan rincian skor terbuka tidak boleh memunculkan jendela baru.
+    win._trend_open = True
+    win.show()
+    for tf_btn in win.tf_group.buttons():
+        tf_btn.setChecked(True)
+        qapp.processEvents()
+    extra = [w for w in QApplication.topLevelWidgets() if w.isVisible() and w is not win]
+    assert extra == [], extra
+
     # Alat gambar: garis tren di WTI harian tersimpan dan muncul lagi setelah jendela dibuka ulang.
     for row in range(win.asset_list.count()):
         if win.asset_list.item(row).data(0x0100) == "WTI":

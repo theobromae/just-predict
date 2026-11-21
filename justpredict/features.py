@@ -7,7 +7,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-FEATURE_VERSION = "tech-v2-ta"
+FEATURE_VERSION = "tech-v3-fund"
 
 
 from .technicals import rsi as _rsi, ta_features  # noqa: E402
@@ -55,10 +55,12 @@ def build_dataset(close: pd.Series, horizon: int,
     X = technical_features(close)
     if ohlcv is not None and not ohlcv.empty:
         X = X.join(ta_features(ohlcv.reindex(close.index)))
-    if extra is not None and not extra.empty:
-        X = X.join(extra.reindex(X.index).ffill())
-    y = forward_return(close, horizon)
     valid = X.notna().all(axis=1)
+    if extra is not None and not extra.empty:
+        # Fitur tambahan boleh kosong (LightGBM menangani NaN), jadi tidak ikut memangkas baris latih.
+        ex = extra.reindex(extra.index.union(X.index)).sort_index().ffill().reindex(X.index)
+        X = X.join(ex.add_prefix("x_"))
+    y = forward_return(close, horizon)
     X_latest = X.loc[valid].iloc[[-1]] if valid.any() else X.iloc[0:0]
     train_mask = valid & y.notna()
     return X.loc[train_mask], y.loc[train_mask], X_latest

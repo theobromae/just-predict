@@ -246,7 +246,8 @@ class Card(QFrame):
                 it = layout.takeAt(0)
                 if it.widget():
                     w = it.widget()
-                    w.setParent(None)  # lepas sekarang juga agar tidak tertinggal di layar
+                    # Sembunyikan lalu hapus. Jangan setParent(None): widget jadi jendela tersendiri.
+                    w.hide()
                     w.deleteLater()
                 elif it.layout():
                     _clear(it.layout())
@@ -724,6 +725,18 @@ class MainWindow(QMainWindow):
                 self.price_plot.addItem(sp)
                 self.price_plot.plot([], [], pen=None, symbol="t1", symbolBrush=UP, symbolPen=None, name="Pola candle")
 
+        # ---- penanda tanggal laporan keuangan (saham, tampilan harian/mingguan/bulanan)
+        if not index_mode and s.reports:
+            lo_d, hi_d = cd.index.min(), cd.index.max()
+            for d in s.reports:
+                if lo_d <= d <= hi_d:
+                    self.price_plot.addItem(pg.InfiniteLine(
+                        _ts([d])[0], angle=90, pen=pg.mkPen(FAINT, width=1, style=Qt.DotLine), label="L",
+                        labelOpts={"position": 0.04, "color": TEXT, "fill": SURFACE_2,
+                                   "anchors": [(0.5, 0), (0.5, 0)]}))
+            self.price_plot.plot([], [], pen=pg.mkPen(FAINT, style=Qt.DotLine),
+                                 name="L = laporan keuangan (perkiraan terbit)")
+
         # ---- prediksi lalu
         if self.cb_past.isChecked() and not s.past.empty:
             past = s.past
@@ -856,30 +869,45 @@ class MainWindow(QMainWindow):
             g = QGridLayout()
             g.setHorizontalSpacing(10)
             g.setVerticalSpacing(5)
-            n = len(s.trend_details)
-            for i, (text, pts) in enumerate(s.trend_details):
-                summary_row = i >= n - 2  # total teknikal dan arah tren akhir
-                t = QLabel(text)
+            import html as _html
+            row = 0
+            for kind, text, pts in s.trend_details:
+                if kind in ("head", "total"):
+                    line = QFrame()
+                    line.setFixedHeight(1)
+                    line.setStyleSheet(f"background: {BORDER};")
+                    g.addWidget(line, row, 0, 1, 2)
+                    row += 1
+                if kind == "link":
+                    sign, _, url = pts.partition("|")
+                    color = UP if sign == "+" else DOWN
+                    body = _html.escape(text)
+                    t = QLabel(f"<span style='color:{color}'>{'▲' if sign == '+' else '▼'}</span> "
+                               + (f"<a style='color:{MUTED}' href='{_html.escape(url)}'>{body}</a>" if url else body))
+                    t.setTextFormat(Qt.RichText)
+                    t.setOpenExternalLinks(True)
+                    t.setToolTip("Buka berita di browser")
+                    pts = ""
+                else:
+                    t = QLabel(text)
+                strong = kind in ("head", "total")
                 t.setWordWrap(True)
-                t.setStyleSheet(f"color: {TEXT if summary_row else MUTED};" + (" font-weight: 600;" if summary_row else ""))
+                t.setStyleSheet({"head": f"color: {TEXT}; font-weight: 600;", "total": f"color: {TEXT}; font-weight: 700;",
+                                 "note": f"color: {FAINT}; font-size: 11px;"}.get(kind, f"color: {MUTED};")
+                                + ("" if strong else " margin-left: 8px;"))
                 v = QLabel(pts)
                 color = UP if pts.startswith("+") else DOWN if pts.startswith("-") else NEUTRAL
                 v.setStyleSheet(f"color: {color}; font-weight: 700;")
                 v.setAlignment(Qt.AlignRight | Qt.AlignTop)
-                if i == n - 2:
-                    line = QFrame()
-                    line.setFixedHeight(1)
-                    line.setStyleSheet(f"background: {BORDER};")
-                    g.addWidget(line, 2 * i, 0, 1, 2)
-                g.addWidget(t, 2 * i + 1, 0)
-                g.addWidget(v, 2 * i + 1, 1)
+                g.addWidget(t, row, 0)
+                g.addWidget(v, row, 1)
+                row += 1
             g.setColumnStretch(0, 1)
             dv.addLayout(g)
             rules = QLabel(TREND_RULES)
             rules.setWordWrap(True)
             rules.setObjectName("faint")
             dv.addWidget(rules)
-            details.setVisible(self._trend_open)
 
             def _toggle(on, b=exp, w=details):
                 self._trend_open = on
@@ -887,10 +915,12 @@ class MainWindow(QMainWindow):
                 b.setText(("▾" if on else "▸") + "  Rincian skor")
                 w.setVisible(on)
 
-            _toggle(self._trend_open)
-            exp.toggled.connect(_toggle)
+            # Masukkan ke layout DULU baru atur visibilitas: widget tanpa induk yang di-setVisible(True)
+            # akan muncul sebagai jendela baru (di macOS full screen jadi Space baru tiap ganti tampilan).
             self.card_trend.body.addWidget(exp)
             self.card_trend.body.addWidget(details)
+            _toggle(self._trend_open)
+            exp.toggled.connect(_toggle)
 
         # Perkiraan utama
         if s.has_prediction:

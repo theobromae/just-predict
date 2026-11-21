@@ -234,7 +234,7 @@ def test_intraday_and_path(store):
     s = summarize(store, "WTI", "harian")
     assert s.trend in {"Bullish", "Cenderung bullish", "Sideways", "Cenderung bearish", "Bearish", "Belum jelas"}
     assert s.ta is not None
-    assert s.trend_details and s.trend_details[0][0].startswith("Model ML")
+    assert s.trend_details and s.trend_details[0][1] == "Model ML"
     # Prediksi per jam: 8 titik untuk 1 jam, horizon dalam batang.
     p1 = forecast_path(store, "WTI", "1jam")
     assert list(p1.h) == list(range(1, 9)) and p1.attrs["intraday"]
@@ -304,3 +304,91 @@ def test_path_with_only_old_ensemble_predictions(store):
     assert path.mid.dtype == float
     summarize(store, "WTI", "harian")
     summarize(store, "WTI", "1jam")
+
+
+class FakeFullSource(FakeSource):
+    """FakeSource plus data fundamental, makro, dan berita (meniru format yfinance/FRED/RSS)."""
+
+    def statements(self, ticker):
+        end = self.full_index[self.cut - 1]
+        q_dates = pd.date_range(end=end - pd.Timedelta(days=60), periods=6, freq="QE")[::-1]
+        a_dates = pd.date_range(end=end - pd.Timedelta(days=120), periods=4, freq="YE")[::-1]
+        grow = lambda n, base: [base * (1.05 ** -i) for i in range(n)]
+        qi = pd.DataFrame([grow(6, 2.5e12), grow(6, 2e13)], index=["Net Income", "Total Revenue"], columns=q_dates)
+        ai = pd.DataFrame([grow(4, 9e12), grow(4, 8e13)], index=["Net Income", "Total Revenue"], columns=a_dates)
+        bs = lambda cols: pd.DataFrame([[6e13] * len(cols), [3e13] * len(cols), [1e11] * len(cols)],
+                                       index=["Stockholders Equity", "Total Debt", "Ordinary Shares Number"], columns=cols)
+        return {"currency": "IDR", "quarterly_income": qi, "annual_income": ai,
+                "quarterly_balance": bs(q_dates), "annual_balance": bs(a_dates)}
+
+    def _daily(self, start_value, drift):
+        idx = self.full_index[: self.cut]
+        return pd.Series(start_value * np.exp(np.linspace(0, drift, len(idx))), index=idx)
+
+    def daily(self, ticker):
+        return self._daily(100.0, -0.2) if ticker == "DX-Y.NYB" else self._daily(4.0, -0.3)
+
+    def fred(self, series_id):
+        idx = pd.date_range(self.full_index[0], self.full_index[self.cut - 1], freq="W-FRI")
+        if series_id == "DFF":
+            return pd.Series(np.where(np.arange(len(idx)) > len(idx) - 8, 4.0, 4.5), index=idx)
+        if series_id == "WCESTUS1":
+            return pd.Series(np.linspace(450e3, 400e3, len(idx)), index=idx)
+        return pd.Series(6.0, index=pd.date_range(idx[0], idx[-1], freq="MS"))
+
+    def fear_greed(self):
+        return pd.Series(20.0, index=self.full_index[: self.cut])
+
+    def hash_rate(self):
+        return self._daily(500.0, 1.0)
+
+    def fetch_news(self, query, lang):
+        now = pd.Timestamp.now(tz="UTC").tz_localize(None)
+        titles = ["Harga naik menguat tajam", "Saham melonjak ke rekor tertinggi", "Laba tumbuh positif",
+                  "Analis optimis, harga rebound", "Investor borong, harga melesat", "Pasar tidak melemah"]
+        return [{"title": f"{t} ({query})", "link": f"https://example.com/{i}", "source": "Contoh",
+                 "published": now - pd.Timedelta(hours=i)} for i, t in enumerate(titles)]
+
+
+def test_sentiment_lexicon():
+    from justpredict.data.news import score_title
+    assert score_title("IHSG menguat, saham bank melonjak") == 1.0
+    assert score_title("Harga minyak anjlok karena kekhawatiran resesi") == -1.0
+    assert score_title("Saham tidak melemah") == 1.0  # negasi
+    assert score_title("Rupiah menguat terhadap dolar", "USDIDR") == -1.0  # Rupiah kuat = USD/IDR turun
+    assert score_title("Rapat umum pemegang saham") == 0.0
+
+
+def test_statement_series_lagged_and_ttm():
+    from justpredict.data.fundamentals import statement_series
+    st = FakeFullSource().statements("TLKM.JK")
+    s = statement_series(st)
+    ni = s["net_income_ttm"]
+    q_end = st["quarterly_income"].columns.max()
+    lag = 90 if q_end.month == 12 else 45
+    assert ni.index.max() == q_end + pd.Timedelta(days=lag)  # tanggal terbit, bukan akhir kuartal
+    assert ni.iloc[-1] == pytest.approx(sum(2.5e12 * 1.05 ** -i for i in range(4)))
+    assert set(s) == {"net_income_ttm", "revenue_ttm", "equity", "debt", "shares"}
+
+
+def test_fundamentals_news_and_trend_details(store):
+    from justpredict.data.fundamentals import assess, fundamental_features
+    from justpredict.viewmodel import summarize
+    src = FakeFullSource(days=700)
+    run_cycle(store, src, assets=["TLKM", "BTC"], with_path=False, with_intraday=False)
+    f = fundamental_features(store, "TLKM")
+    assert {"log_pe_rel", "roe", "der", "ni_growth_yoy", "dxy_ret_20"} <= set(f.columns)
+    today = store.prices("TLKM").index[-1]
+    a = assess(store, "TLKM", today=today)
+    texts = " ".join(t for t, _ in a.items)
+    assert "Laba bersih" in texts and "ROE" in texts and "Dolar AS" in texts
+    b = assess(store, "BTC", today=today)
+    assert any("Fear & Greed 20" in t and p == 1 for t, p in b.items)
+    bt = store.backtests()
+    assert {"lightgbm_fund", "lightgbm_base"} <= set(bt[bt.asset == "TLKM"].model)
+    s = summarize(store, "TLKM", "harian")
+    kinds = [k for k, _, _ in s.trend_details]
+    heads = [t for k, t, _ in s.trend_details if k == "head"]
+    assert any(h.startswith("Fundamental") for h in heads) and any(h.startswith("Sentimen berita: positif") for h in heads)
+    assert "link" in kinds and kinds[-1] == "total"
+    assert s.sentiment.direction == 1 and s.reports

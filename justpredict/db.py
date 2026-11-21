@@ -68,6 +68,35 @@ CREATE TABLE IF NOT EXISTS backtests (
     PRIMARY KEY (asset, horizon, model)
 );
 
+-- Data fundamental dan makro, format panjang. date = tanggal data dianggap SUDAH TERSEDIA
+-- (mis. akhir kuartal + jeda terbit laporan), agar model tidak memakai angka sebelum terbit.
+-- asset = kunci aset, atau 'MACRO' untuk data makro bersama.
+CREATE TABLE IF NOT EXISTS fundamentals (
+    asset  TEXT NOT NULL,
+    series TEXT NOT NULL,
+    date   TEXT NOT NULL,
+    value  REAL NOT NULL,
+    PRIMARY KEY (asset, series, date)
+);
+
+-- Judul berita dari RSS beserta skor sentimennya (-1 negatif .. +1 positif).
+CREATE TABLE IF NOT EXISTS news (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset     TEXT NOT NULL,
+    published TEXT NOT NULL,      -- YYYY-MM-DD HH:MM (UTC)
+    title     TEXT NOT NULL,
+    link      TEXT,
+    source    TEXT,
+    score     REAL NOT NULL,
+    UNIQUE (asset, title)
+);
+
+-- Kapan sebuah sumber terakhir diambil (agar data yang jarang berubah tidak diambil tiap buka).
+CREATE TABLE IF NOT EXISTS fetch_log (
+    key        TEXT PRIMARY KEY,
+    fetched_at TEXT NOT NULL
+);
+
 -- Gambar pengguna di grafik (garis tren, kotak, Fibonacci, dll.), per aset.
 -- points = JSON [[detik epoch, harga], ...] agar tetap di tempatnya di semua tampilan waktu.
 CREATE TABLE IF NOT EXISTS drawings (
@@ -269,4 +298,53 @@ class Store:
 
     def clear_drawings(self, asset: str) -> None:
         self.conn.execute("DELETE FROM drawings WHERE asset=?", (asset,))
+        self.conn.commit()
+
+    # ---------- fundamental & makro ----------
+    def upsert_fundamental(self, asset: str, series: str, values: pd.Series) -> int:
+        values = pd.to_numeric(values, errors="coerce").dropna()
+        if values.empty:
+            return 0
+        rows = [(asset, series, pd.Timestamp(d).strftime("%Y-%m-%d"), float(v)) for d, v in values.items()]
+        self.conn.executemany("INSERT OR REPLACE INTO fundamentals(asset, series, date, value) VALUES (?,?,?,?)", rows)
+        self.conn.commit()
+        return len(rows)
+
+    def fundamental(self, asset: str, series: str) -> pd.Series:
+        rows = self.conn.execute("SELECT date, value FROM fundamentals WHERE asset=? AND series=? ORDER BY date",
+                                 (asset, series)).fetchall()
+        if not rows:
+            return pd.Series(dtype=float)
+        d, v = zip(*rows)
+        return pd.Series(v, index=pd.DatetimeIndex(pd.to_datetime(d)), dtype=float, name=series)
+
+    def fundamental_series(self, asset: str) -> list[str]:
+        return [r[0] for r in self.conn.execute("SELECT DISTINCT series FROM fundamentals WHERE asset=?", (asset,))]
+
+    # ---------- berita ----------
+    def upsert_news(self, asset: str, items: list[dict]) -> int:
+        rows = [(asset, it["published"], it["title"], it.get("link"), it.get("source"), float(it["score"]))
+                for it in items]
+        if not rows:
+            return 0
+        self.conn.executemany("INSERT OR IGNORE INTO news(asset, published, title, link, source, score) "
+                              "VALUES (?,?,?,?,?,?)", rows)
+        self.conn.commit()
+        return len(rows)
+
+    def news(self, asset: str, since: str | None = None) -> pd.DataFrame:
+        q, params = "SELECT published, title, link, source, score FROM news WHERE asset=?", [asset]
+        if since:
+            q += " AND published >= ?"
+            params.append(since)
+        return pd.read_sql_query(q + " ORDER BY published DESC", self.conn, params=params)
+
+    # ---------- log pengambilan ----------
+    def last_fetch(self, key: str) -> pd.Timestamp | None:
+        r = self.conn.execute("SELECT fetched_at FROM fetch_log WHERE key=?", (key,)).fetchone()
+        return pd.Timestamp(r[0]) if r else None
+
+    def mark_fetch(self, key: str) -> None:
+        self.conn.execute("INSERT OR REPLACE INTO fetch_log(key, fetched_at) VALUES (?, ?)",
+                          (key, pd.Timestamp.now(tz="UTC").tz_localize(None).strftime("%Y-%m-%d %H:%M:%S")))
         self.conn.commit()

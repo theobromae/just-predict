@@ -50,6 +50,25 @@ Analisis teknikal (`technicals.py`) juga menjadi fitur model: jarak ke support/r
 pola candle (hammer, engulfing, shooting star, doji), kemiringan dan divergensi RSI, golden/death cross,
 Bollinger %B, ATR, kemiringan tren, dan rasio volume.
 
+### Fundamental dan sentimen (v0.2)
+
+- **Saham** (`data/fundamentals.py`): laporan keuangan dari Yahoo Finance: laba dan pendapatan 12 bulan,
+  ekuitas, utang, jumlah saham. Dari situ dihitung PER/PBV dibanding rata-rata 5 tahun (Murah/Wajar/Mahal),
+  pertumbuhan laba, ROE, dan DER. Laporan berdenominasi USD (mis. ADRO) dikonversi ke Rupiah.
+- **Makro**: indeks dolar (DXY) dan imbal hasil obligasi AS 10 tahun (Yahoo), suku bunga The Fed,
+  suku bunga Indonesia, dan stok minyak mentah AS/EIA (FRED, CSV publik). **Bitcoin**: Fear & Greed
+  (alternative.me) dan hash rate (blockchain.com).
+- Semua angka dicatat sejak tanggal **dianggap terbit** (kuartal +45 hari, tahunan +90 hari, data bulanan
+  +45 hari), jadi model tidak memakai angka sebelum publik bisa melihatnya. Penanda **L** di grafik saham
+  menunjukkan perkiraan tanggal terbit itu.
+- Fitur fundamental **hanya dipakai model kalau di uji data lama tidak memperburuk** arah dan galat
+  (backtest `lightgbm_fund` vs `lightgbm_base`). Hasil keputusan ini tampil di rincian skor.
+- **Sentimen berita** (`data/news.py`): judul dari Google News RSS, dinilai dengan kamus kata keuangan
+  Indonesia/Inggris plus negasi. Karena RSS hanya berisi beberapa minggu, sentimen dipakai di skor Arah
+  Tren, belum sebagai fitur model.
+- **Arah Tren** = 4 kelompok (model ML, teknikal, fundamental/makro, sentimen), masing-masing +1/0/−1.
+  Rinciannya, termasuk judul berita yang bisa diklik, ada di dropdown **Rincian skor**.
+
 Semua data disimpan di `~/Library/Application Support/JustPredict/justpredict.sqlite`.
 
 ## Struktur
