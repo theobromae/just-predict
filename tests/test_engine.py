@@ -249,3 +249,12 @@ def test_technicals_detect_patterns():
     assert any("Hammer" in s.text for s in res.signals)
     f = ta_features(df)
     pd.testing.assert_frame_equal(f.iloc[:50], ta_features(df.iloc[:50]))  # tanpa bocoran masa depan
+
+
+def test_close_only_prices_still_predict(store):
+    """Data tanpa OHLC/volume (mis. database lama) tetap bisa dilatih."""
+    from justpredict.engine import predict_asset
+    idx = pd.bdate_range("2020-01-01", periods=700)
+    store.upsert_prices("WTI", pd.Series(100 * np.exp(np.cumsum(np.random.default_rng(0).normal(0, 0.01, 700))), index=idx))
+    assert store.ohlcv("WTI").dtypes.eq(float).all()
+    assert predict_asset(store, "WTI", 1)

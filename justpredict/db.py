@@ -137,6 +137,7 @@ class Store:
             "SELECT ts, open, high, low, close, volume FROM prices_intraday WHERE asset=? ORDER BY ts",
             self.conn, params=(asset,))
         df.index = pd.to_datetime(df.pop("ts"), unit="s", utc=True)
+        df = df.astype(float)
         for c in ("open", "high", "low"):
             df[c] = df[c].fillna(df["close"])
         return df
@@ -152,6 +153,7 @@ class Store:
             "SELECT date, open, high, low, close, volume FROM prices WHERE asset=? ORDER BY date",
             self.conn, params=(asset,))
         df.index = pd.to_datetime(df.pop("date"))
+        df = df.astype(float)  # kolom yang seluruhnya NULL terbaca sebagai object/None
         # Hari tanpa OHLC (mis. data lama): pakai close supaya candle tetap tergambar.
         for c in ("open", "high", "low"):
             df[c] = df[c].fillna(df["close"])
