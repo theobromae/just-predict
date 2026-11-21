@@ -31,11 +31,21 @@ def main(argv: list[str] | None = None) -> int:
     from .applog import setup_logging
     setup_logging()
     if args.cmd in (None, "gui"):
+        import os
         from .gui.app import main as gui_main
-        return gui_main()
+        code = gui_main()
+        # Data sudah tersimpan saat jendela ditutup; keluar langsung agar aplikasi tidak
+        # menggantung menunggu thread OpenMP/Qt dibersihkan.
+        logging.shutdown()
+        os._exit(code)
     if args.cmd == "gui-smoke":
+        import os
         from .gui.smoke import run as smoke
-        return smoke()
+        code = smoke()
+        print(f"smoke: selesai dengan kode {code}", flush=True)
+        logging.shutdown()
+        os._exit(code)  # jangan menunggu pembersihan Qt/OpenMP saat keluar
+
 
     if args.cmd == "selftest":
         return selftest()

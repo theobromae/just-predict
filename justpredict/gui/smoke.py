@@ -80,7 +80,7 @@ def run() -> int:
         win.show()
         app.processEvents()
         print("smoke: jendela terbuka", flush=True)
-        for row in range(win.asset_list.count()):
+        for row in (0, 3, 4):  # WTI, emas Rp/gram (turunan), Bitcoin (7 hari seminggu)
             win.asset_list.setCurrentRow(row)
             print(f"smoke: aset {win.current_asset()}", flush=True)
             for tf in win.tf_group.buttons():
@@ -111,8 +111,10 @@ def run() -> int:
             tf.setChecked(True)
             win._refresh_chart()
             app.processEvents()
+        print("smoke: gambar ulang setelah siklus selesai", flush=True)
         win.close()
         app.processEvents()
+        print("smoke: jendela ditutup", flush=True)
         if errors:
             print("smoke: ada error di slot Qt\n" + "\n".join(errors), flush=True)
             return 1
