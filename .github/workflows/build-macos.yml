@@ -8,6 +8,7 @@ on:
 jobs:
   build:
     runs-on: macos-latest   # Apple Silicon (arm64)
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

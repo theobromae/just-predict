@@ -27,6 +27,7 @@ pyinstaller --noconfirm --clean --windowed \
 
 ./dist/JustPredict.app/Contents/MacOS/JustPredict selftest
 # Buka jendela aplikasi hasil build dengan data sintetis, coba semua tampilan, lalu tutup.
-./dist/JustPredict.app/Contents/MacOS/JustPredict gui-smoke
+# Batas waktu 15 menit (macOS tidak punya perintah `timeout`).
+perl -e 'alarm 900; exec @ARGV' ./dist/JustPredict.app/Contents/MacOS/JustPredict gui-smoke
 (cd dist && ditto -c -k --keepParent JustPredict.app JustPredict-macos-arm64.zip)
 echo "Selesai: dist/JustPredict.app dan dist/JustPredict-macos-arm64.zip"

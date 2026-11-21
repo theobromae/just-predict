@@ -802,6 +802,9 @@ def show_error(title: str, details: str) -> None:
 def _excepthook(exc_type, exc, tb):
     text = "".join(traceback.format_exception(exc_type, exc, tb))
     logging.getLogger("justpredict.gui").error("Error tak tertangani:\n%s", text)
+    import os
+    if os.environ.get("JUSTPREDICT_NO_DIALOG"):
+        return
     try:
         show_error("Terjadi kesalahan. Aplikasi tetap berjalan, tapi tampilan mungkin tidak lengkap.", text)
     except Exception:
@@ -815,9 +818,11 @@ def main() -> int:
     try:
         win = MainWindow()
     except Exception:
+        import os
         text = traceback.format_exc()
         log.error("Gagal membuka jendela:\n%s", text)
-        show_error("Aplikasi gagal dibuka.", text)
+        if not os.environ.get("JUSTPREDICT_NO_DIALOG"):
+            show_error("Aplikasi gagal dibuka.", text)
         return 1
     win.show()
     win.raise_()

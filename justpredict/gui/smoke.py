@@ -57,9 +57,10 @@ def _synthetic(store, days: int = 900) -> None:
 def run() -> int:
     tmp = tempfile.mkdtemp(prefix="justpredict-smoke-")
     os.environ["JUSTPREDICT_HOME"] = tmp
+    os.environ["JUSTPREDICT_NO_DIALOG"] = "1"  # jangan pernah menunggu klik di CI
+    errors: list[str] = []
+    sys.excepthook = lambda t, e, tb: errors.append("".join(traceback.format_exception(t, e, tb)))
     try:
-        from PySide6.QtCore import QEventLoop, QTimer
-
         from .. import engine
         from ..config import db_path
         from ..db import Store
@@ -78,8 +79,10 @@ def run() -> int:
         win = MainWindow(autostart=False)
         win.show()
         app.processEvents()
+        print("smoke: jendela terbuka", flush=True)
         for row in range(win.asset_list.count()):
             win.asset_list.setCurrentRow(row)
+            print(f"smoke: aset {win.current_asset()}", flush=True)
             for tf in win.tf_group.buttons():
                 tf.setChecked(True)
                 for ty in win.type_group.buttons():
@@ -89,24 +92,30 @@ def run() -> int:
         print("smoke: semua tampilan tergambar", flush=True)
 
         # Jalankan siklus lewat thread seperti saat aplikasi dibuka (tanpa internet).
-        loop = QEventLoop()
-        result = {}
+        import time
         win.start_cycle(fetch=False)
-        win._worker.finished.connect(lambda rep: (result.setdefault("ok", rep), loop.quit()))
-        win._worker.failed.connect(lambda tb: (result.setdefault("err", tb), loop.quit()))
-        QTimer.singleShot(600_000, loop.quit)
-        loop.exec()
+        deadline = time.monotonic() + 600
+        while win._thread is not None and time.monotonic() < deadline:
+            app.processEvents()
+            time.sleep(0.05)
         app.processEvents()
-        if "err" in result or "ok" not in result:
-            print("smoke: siklus gagal\n" + result.get("err", "timeout"), flush=True)
+        if win._thread is not None:
+            print("smoke: siklus tidak selesai dalam 10 menit", flush=True)
             return 1
-        print(f"smoke: siklus selesai ({result['ok'].predicted} prediksi)", flush=True)
+        status = win.status.text()
+        print(f"smoke: siklus selesai: {status}", flush=True)
+        if "kesalahan" in status.lower():
+            print(win.log.toPlainText()[-3000:], flush=True)
+            return 1
         for tf in win.tf_group.buttons():  # gambar ulang setelah jalur prediksi tersedia
             tf.setChecked(True)
             win._refresh_chart()
             app.processEvents()
         win.close()
         app.processEvents()
+        if errors:
+            print("smoke: ada error di slot Qt\n" + "\n".join(errors), flush=True)
+            return 1
         return 0
     except Exception:
         print("smoke: GAGAL\n" + traceback.format_exc(), flush=True)
