@@ -32,8 +32,13 @@ class FakeSource:
         self.cut += n
 
     def fetch(self, ticker, start):
-        s = self.series[ticker].iloc[: self.cut]
-        return s[s.index >= pd.Timestamp(start)]
+        c = self.series[ticker].iloc[: self.cut]
+        c = c[c.index >= pd.Timestamp(start)]
+        rng = np.random.default_rng(len(c))
+        o = c.shift(1).fillna(c)
+        spread = c * 0.005 * (1 + rng.random(len(c)))
+        return pd.DataFrame({"open": o, "high": np.maximum(o, c) + spread, "low": np.minimum(o, c) - spread,
+                             "close": c, "volume": rng.integers(1e5, 1e6, len(c)).astype(float)})
 
 
 @pytest.fixture
@@ -146,3 +151,43 @@ def test_signal_withheld_when_model_unproven(store):
     bt = store.backtests()
     assert not is_proven(bt, "WTI", 1)
     assert is_proven(bt, "WTI", 5)
+
+
+def test_ohlcv_stored_and_old_db_migrated(tmp_path):
+    import sqlite3
+    path = tmp_path / "old.sqlite"
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE prices (asset TEXT NOT NULL, date TEXT NOT NULL, close REAL NOT NULL, "
+                "PRIMARY KEY (asset, date))")
+    con.executemany("INSERT INTO prices VALUES ('WTI', ?, 1.0)",
+                    [(d.strftime("%Y-%m-%d"),) for d in pd.bdate_range("2021-01-01", periods=30)])
+    con.commit(); con.close()
+    s = Store(path)
+    assert s.missing_ohlc("WTI")
+    src = FakeSource(days=500)
+    update_all(s, src)
+    o = s.ohlcv("WTI")
+    assert not s.missing_ohlc("WTI") and len(o) == 500
+    assert (o["high"] >= o[["open", "close"]].max(axis=1)).all()
+    g = s.ohlcv("GOLD_IDR_G")
+    assert (g["high"] >= g["low"]).all() and g["volume"].isna().all()
+    s.close()
+
+
+def test_viewmodel_summary_and_resample(store):
+    from justpredict.viewmodel import chart_data, resample_ohlcv, summarize
+    src = FakeSource(days=700)
+    run_cycle(store, src, assets=["TLKM"])
+    daily = store.ohlcv("TLKM")
+    weekly = resample_ohlcv(daily, "W-FRI")
+    assert len(weekly) < len(daily) / 4
+    assert weekly["high"].iloc[-1] == daily["high"].loc[daily.index > weekly.index[-2]].max()
+    assert weekly.index[-1] == daily.index[-1]  # label = hari perdagangan terakhir
+    cd = chart_data(store, "TLKM", "bulanan")
+    assert {"rsi", "ma20", "ma50"} <= set(cd.columns)
+    s = summarize(store, "TLKM", "mingguan")
+    assert s.has_prediction and s.horizon == 5
+    assert s.low <= s.median <= s.high
+    assert "8 dari 10" in s.lines["range"] and s.signal in {"BELI", "JUAL", "TAHAN"}
+    empty = summarize(store, "BTC", "harian")
+    assert not empty.has_prediction

@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS prices (
     asset TEXT NOT NULL,
     date  TEXT NOT NULL,          -- YYYY-MM-DD
     close REAL NOT NULL,
+    open REAL, high REAL, low REAL, volume REAL,
     PRIMARY KEY (asset, date)
 );
 
@@ -67,21 +68,55 @@ class Store:
         self.conn = sqlite3.connect(self.path)
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        # Database v0.1 awal hanya punya kolom close.
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(prices)")}
+        for c in ("open", "high", "low", "volume"):
+            if c not in cols:
+                self.conn.execute(f"ALTER TABLE prices ADD COLUMN {c} REAL")
+        self.conn.commit()
 
     def close(self) -> None:
         self.conn.close()
 
     # ---------- harga ----------
-    def upsert_prices(self, asset: str, series: pd.Series) -> int:
-        series = series.dropna()
-        rows = [(asset, pd.Timestamp(d).strftime("%Y-%m-%d"), float(v)) for d, v in series.items()]
+    def upsert_prices(self, asset: str, data: pd.Series | pd.DataFrame) -> int:
+        """Simpan harga. `data` = deret close, atau DataFrame berkolom open/high/low/close/volume."""
+        df = data.to_frame("close") if isinstance(data, pd.Series) else data.copy()
+        df = df.dropna(subset=["close"])
+        for c in ("open", "high", "low", "volume"):
+            if c not in df:
+                df[c] = None
+        f = lambda v: None if v is None or pd.isna(v) else float(v)
+        rows = [(asset, pd.Timestamp(d).strftime("%Y-%m-%d"), float(r.close), f(r.open), f(r.high),
+                 f(r.low), f(r.volume)) for d, r in zip(df.index, df.itertuples())]
         self.conn.executemany(
-            "INSERT INTO prices(asset, date, close) VALUES (?,?,?) "
-            "ON CONFLICT(asset, date) DO UPDATE SET close=excluded.close",
+            "INSERT INTO prices(asset, date, close, open, high, low, volume) VALUES (?,?,?,?,?,?,?) "
+            "ON CONFLICT(asset, date) DO UPDATE SET close=excluded.close, "
+            "open=COALESCE(excluded.open, open), high=COALESCE(excluded.high, high), "
+            "low=COALESCE(excluded.low, low), volume=COALESCE(excluded.volume, volume)",
             rows,
         )
         self.conn.commit()
         return len(rows)
+
+    def missing_ohlc(self, asset: str) -> bool:
+        """True kalau banyak baris belum punya OHLC (database dari versi lama)."""
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM prices WHERE asset=? AND open IS NULL", (asset,)).fetchone()
+        return row[0] > 10
+
+    def ohlcv(self, asset: str) -> pd.DataFrame:
+        df = pd.read_sql_query(
+            "SELECT date, open, high, low, close, volume FROM prices WHERE asset=? ORDER BY date",
+            self.conn, params=(asset,))
+        df.index = pd.to_datetime(df.pop("date"))
+        # Hari tanpa OHLC (mis. data lama): pakai close supaya candle tetap tergambar.
+        for c in ("open", "high", "low"):
+            df[c] = df[c].fillna(df["close"])
+        return df
 
     def last_price_date(self, asset: str) -> str | None:
         row = self.conn.execute("SELECT MAX(date) FROM prices WHERE asset=?", (asset,)).fetchone()

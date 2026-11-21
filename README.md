@@ -24,6 +24,18 @@ Setiap kali aplikasi dibuka:
 5. **Sinyal BELI/JUAL/TAHAN** hanya diberikan kalau di backtest model benar arahnya ≥52% *dan*
    mengalahkan tebakan naif ("harga tetap"). Selain itu sinyal ditahan dan ditandai "Belum terbukti".
 
+## Tampilan
+
+Saat dibuka, aplikasi langsung menampilkan **grafik** dari data tersimpan, lalu memperbarui data dan
+prediksi di belakang. Satu layar berisi:
+
+- daftar aset di kiri, dengan harga terakhir dan perkiraan perubahan;
+- pilihan **Harian / Mingguan / Bulanan** (batang grafik dan prediksi ikut menyesuaikan jangka waktunya);
+- pilihan **Garis / Candle**, indikator **Volume**, **RSI**, **Rata-rata 20/50**, dan titik **Prediksi lalu**
+  (hijau = arah benar, merah = salah);
+- panel kanan berbahasa awam: perkiraan harga dan rentangnya, saran, seberapa bisa dipercaya
+  (akurasi backtest dan akurasi nyata), serta kondisi teknikal saat ini.
+
 Semua data disimpan di `~/Library/Application Support/JustPredict/justpredict.sqlite`.
 
 ## Struktur
@@ -36,6 +48,7 @@ Semua data disimpan di `~/Library/Application Support/JustPredict/justpredict.sq
 | `justpredict/models/` | model plug-in: `naive` (baseline) dan `lightgbm` (kuantil + arah) |
 | `justpredict/adaptive.py` | bobot ansambel dan koreksi galat |
 | `justpredict/engine.py` | siklus update → evaluasi → latih → prediksi |
+| `justpredict/viewmodel.py` | data grafik (resample, indikator) dan teks penjelasan |
 | `justpredict/gui/app.py` | aplikasi desktop PySide6 |
 
 Menambah model baru: buat kelas turunan `Forecaster` (lihat `models/base.py`) lalu daftarkan di
