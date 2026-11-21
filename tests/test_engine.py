@@ -40,6 +40,30 @@ class FakeSource:
         return pd.DataFrame({"open": o, "high": np.maximum(o, c) + spread, "low": np.minimum(o, c) - spread,
                              "close": c, "volume": rng.integers(1e5, 1e6, len(c)).astype(float)})
 
+    intraday_bars_per_day = 7
+
+    def fetch_intraday(self, ticker, start):
+        daily = self.fetch(ticker, "2000-01-01").iloc[-120:]
+        rows = []
+        rng = np.random.default_rng(1)
+        for d, r in daily.iterrows():
+            px = r.open
+            for k in range(self.intraday_bars_per_day):
+                nxt = px * np.exp(rng.normal(0, 0.003))
+                ts = pd.Timestamp(d) + pd.Timedelta(hours=2 + k)  # UTC 02:00.. = 09:00 WIB
+                rows.append((ts, px, max(px, nxt) * 1.001, min(px, nxt) * 0.999, nxt, float(rng.integers(1e4, 1e5))))
+                px = nxt
+        df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"]).set_index("ts")
+        df.index = df.index.tz_localize("UTC")
+        return df[df.index >= start]
+
+
+@pytest.fixture(autouse=True)
+def fewer_path_anchors(monkeypatch):
+    # Jalur penuh lambat; di tes cukup dua titik.
+    import justpredict.engine as eng
+    monkeypatch.setattr(eng, "PATH_ANCHORS", [3, 10])
+
 
 @pytest.fixture
 def store(tmp_path):
@@ -108,6 +132,7 @@ def test_evaluate_waits_until_due(store):
     update_all(store, src)
     evaluate_matured(store)
     ev = store.evaluated("WTI")
+    ev = ev[ev.model != "path"]
     assert set(ev["horizon"]) == {1}  # horizon 5 dan 21 belum jatuh tempo
 
 
@@ -191,3 +216,36 @@ def test_viewmodel_summary_and_resample(store):
     assert "8 dari 10" in s.lines["range"] and s.signal in {"BELI", "JUAL", "TAHAN"}
     empty = summarize(store, "BTC", "harian")
     assert not empty.has_prediction
+
+
+def test_intraday_and_path(store):
+    from justpredict.viewmodel import chart_data, forecast_path, summarize
+    src = FakeSource(days=700)
+    run_cycle(store, src, assets=["WTI", "GOLD_IDR_G"])
+    h1 = chart_data(store, "WTI", "1jam")
+    h4 = chart_data(store, "WTI", "4jam")
+    assert len(h1) > 500 and len(h4) < len(h1) / 2
+    assert h1.index.min().year >= 2021  # waktu tersimpan dengan satuan yang benar
+    assert len(chart_data(store, "GOLD_IDR_G", "1jam")) > 0
+    path = forecast_path(store, "WTI", "harian")
+    assert len(path) == 14  # anchor 1,3,5,10,21 -> 14 titik harian
+    assert (path.lo <= path.mid).all() and (path.mid <= path.hi).all()
+    assert path.date.is_monotonic_increasing
+    s = summarize(store, "WTI", "harian")
+    assert s.trend in {"Bullish", "Cenderung bullish", "Sideways", "Cenderung bearish", "Bearish", "Belum jelas"}
+    assert s.ta is not None
+
+
+def test_technicals_detect_patterns():
+    from justpredict.technicals import candle_patterns, detect, ta_features
+    idx = pd.bdate_range("2024-01-01", periods=60)
+    c = pd.Series(np.linspace(100, 80, 60), index=idx)
+    df = pd.DataFrame({"open": c + 0.5, "high": c + 1, "low": c - 1, "close": c, "volume": 1000.0})
+    # Hammer di akhir tren turun: badan kecil, sumbu bawah panjang.
+    df.iloc[-1] = [79.5, 80.5, 76.0, 80.4, 1000.0]
+    pats = candle_patterns(df)
+    assert pats["hammer"].iloc[-1]
+    res = detect(df)
+    assert any("Hammer" in s.text for s in res.signals)
+    f = ta_features(df)
+    pd.testing.assert_frame_equal(f.iloc[:50], ta_features(df.iloc[:50]))  # tanpa bocoran masa depan

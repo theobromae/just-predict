@@ -12,16 +12,37 @@ import pandas as pd
 
 from .config import ASSET_BY_KEY, HORIZONS
 from .db import Store
+from .engine import PATH_POINTS
 from .features import _rsi
 from .report import is_proven, signal
+from .technicals import TAResult, detect
 
-# Tampilan grafik -> (aturan resample pandas, horizon prediksi dalam hari bursa, jumlah batang awal)
-TIMEFRAMES: dict[str, tuple[str | None, int, int]] = {
-    "harian": (None, HORIZONS["harian"], 120),
-    "mingguan": ("W-FRI", HORIZONS["mingguan"], 104),
-    "bulanan": ("ME", HORIZONS["bulanan"], 60),
+
+@dataclass(frozen=True)
+class Timeframe:
+    label: str
+    source: str          # "daily" atau "intraday"
+    rule: str | None     # aturan resample pandas
+    horizon: int         # horizon prediksi utama (hari bursa) yang ditampilkan di panel
+    n_bars: int          # jumlah batang yang tampil saat dibuka
+    path_key: str | None # jalur prediksi yang digambar (None = tidak digambar)
+
+
+TIMEFRAMES: dict[str, Timeframe] = {
+    "1jam": Timeframe("1 Jam", "intraday", None, 1, 120, None),
+    "4jam": Timeframe("4 Jam", "intraday", "4h", 1, 120, None),
+    "harian": Timeframe("Harian", "daily", None, 1, 120, "harian"),
+    "mingguan": Timeframe("Mingguan", "daily", "W-FRI", 5, 104, "mingguan"),
+    "bulanan": Timeframe("Bulanan", "daily", "ME", 21, 60, "bulanan"),
 }
 HORIZON_TEXT = {1: "besok (1 hari bursa)", 5: "1 minggu lagi", 21: "1 bulan lagi"}
+PATH_TEXT = {"harian": "14 hari bursa ke depan (±3 minggu)", "mingguan": "8 minggu ke depan (±2 bulan)",
+             "bulanan": "6 bulan ke depan"}
+
+
+def local_tz():
+    from datetime import datetime
+    return datetime.now().astimezone().tzinfo
 
 
 # ------------------------------------------------------------------ format
@@ -55,10 +76,25 @@ def resample_ohlcv(df: pd.DataFrame, rule: str | None) -> pd.DataFrame:
     return out
 
 
+def _intraday_local(store: Store, asset: str, rule: str | None) -> pd.DataFrame:
+    df = store.intraday(asset)
+    if df.empty:
+        return df
+    df.index = df.index.tz_convert(local_tz()).tz_localize(None)
+    if rule:
+        df = df.resample(rule, origin="start_day").agg(
+            {"open": "first", "high": "max", "low": "min", "close": "last",
+             "volume": lambda s: s.sum(min_count=1)}).dropna(subset=["close"])
+    return df
+
+
 def chart_data(store: Store, asset: str, timeframe: str) -> pd.DataFrame:
     """OHLCV sesuai tampilan, plus indikator RSI 14 dan rata-rata bergerak 20/50."""
-    rule, _, _ = TIMEFRAMES[timeframe]
-    df = resample_ohlcv(store.ohlcv(asset), rule)
+    tf = TIMEFRAMES[timeframe]
+    if tf.source == "intraday":
+        df = _intraday_local(store, asset, tf.rule)
+    else:
+        df = resample_ohlcv(store.ohlcv(asset), tf.rule)
     if df.empty:
         return df
     df["rsi"] = _rsi(df["close"], 14)
@@ -89,6 +125,11 @@ class Summary:
     reliability: str = "Belum ada data"
     reliability_level: int = 0   # 0 = belum ada, 1 rendah, 2 sedang, 3 baik
     past: pd.DataFrame = field(default_factory=pd.DataFrame)  # prediksi lalu yang sudah dievaluasi
+    path: pd.DataFrame = field(default_factory=pd.DataFrame)  # jalur prediksi (titik-titik ke depan)
+    path_key: str = "harian"
+    ta: TAResult | None = None
+    trend: str = "Sideways"
+    trend_level: int = 0         # +2 bullish, +1 cenderung bullish, 0, -1, -2 bearish
 
 
 def _lean(p_up: float) -> str:
@@ -143,10 +184,59 @@ def _technical_text(cd: pd.DataFrame) -> list[str]:
     return out
 
 
+def forecast_path(store: Store, asset: str, path_key: str) -> pd.DataFrame:
+    """Titik-titik prediksi ke depan. Horizon yang tidak dilatih langsung diinterpolasi."""
+    step, n = PATH_POINTS[path_key]
+    ens, path = store.latest_predictions("ensemble"), store.latest_predictions("path")
+    rows = pd.concat([ens[ens.asset == asset], path[path.asset == asset]]) if not ens.empty else ens
+    if rows.empty:
+        return pd.DataFrame()
+    base_date = rows.base_date.max()
+    rows = rows[rows.base_date == base_date].sort_values("horizon").drop_duplicates("horizon", keep="first")
+    base = float(rows.base_price.iloc[0])
+    hs = np.r_[0, rows.horizon.values]
+    out = []
+    for k in range(1, n + 1):
+        h = step * k
+        if h > hs.max():
+            break
+        q = {c: float(np.interp(h, hs, np.r_[0.0, rows[c].values])) for c in ("q10", "q50", "q90")}
+        p_up = float(np.interp(h, hs, np.r_[0.5, rows.p_up.values]))
+        lo, mid, hi = sorted([q["q10"], q["q50"], q["q90"]])
+        out.append({"h": h, "date": pd.Timestamp(base_date) + pd.offsets.BDay(h),
+                    "mid": base * math.exp(mid), "lo": base * math.exp(lo),
+                    "hi": base * math.exp(hi), "p_up": p_up})
+    df = pd.DataFrame(out)
+    df.attrs.update(base_date=pd.Timestamp(base_date), base_price=base)
+    return df
+
+
+def _trend(path: pd.DataFrame, ta: TAResult | None) -> tuple[str, int, str]:
+    model_dir = 0
+    if not path.empty:
+        end = path.iloc[-1]
+        chg = end["mid"] / path.attrs["base_price"] - 1
+        if end.p_up >= 0.55 and chg > 0:
+            model_dir = 1
+        elif end.p_up <= 0.45 and chg < 0:
+            model_dir = -1
+    score = ta.score if ta else 0
+    ta_dir = 1 if score >= 2 else -1 if score <= -2 else 0
+    total = model_dir + ta_dir
+    label = {2: "Bullish", 1: "Cenderung bullish", 0: "Sideways", -1: "Cenderung bearish", -2: "Bearish"}[total]
+    if model_dir and ta_dir and model_dir != ta_dir:
+        label = "Belum jelas"
+    word = {1: "naik", -1: "turun", 0: "datar"}
+    why = f"Model: {word[model_dir]}. Analisis teknikal: {word[ta_dir]} (skor {score:+d})."
+    return label, total if label != "Belum jelas" else 0, why
+
+
 def summarize(store: Store, asset: str, timeframe: str, cd: pd.DataFrame | None = None) -> Summary:
     a = ASSET_BY_KEY[asset]
-    _, horizon, _ = TIMEFRAMES[timeframe]
-    s = Summary(asset=asset, name=a.name, currency=a.currency, horizon=horizon)
+    tf = TIMEFRAMES[timeframe]
+    horizon = tf.horizon
+    s = Summary(asset=asset, name=a.name, currency=a.currency, horizon=horizon,
+                path_key=tf.path_key or "harian")
     cd = chart_data(store, asset, timeframe) if cd is None else cd
 
     preds = store.latest_predictions()
@@ -210,6 +300,15 @@ def summarize(store: Store, asset: str, timeframe: str, cd: pd.DataFrame | None 
         else:
             s.reliability, s.reliability_level = "Rendah", 1
 
+    s.ta = detect(cd, money=lambda v: money(v, a.currency)) if cd is not None and not cd.empty else None
+    s.path = forecast_path(store, asset, s.path_key)
+    s.trend, s.trend_level, s.lines["trend_why"] = _trend(s.path, s.ta)
+    if not s.path.empty:
+        end = s.path.iloc[-1]
+        chg = end["mid"] / s.path.attrs["base_price"] - 1
+        arrow = "▲" if chg > 0 else "▼"
+        s.lines["path"] = (f"Perkiraan {PATH_TEXT[s.path_key]}: {money(end['mid'], a.currency)} "
+                           f"({arrow} {dec(abs(chg) * 100)}%).")
     s.lines["technical"] = "\n".join(_technical_text(cd))
     return s
 
@@ -218,7 +317,7 @@ def asset_list(store: Store, timeframe: str) -> list[dict]:
     """Untuk daftar aset di sisi kiri: harga terakhir, perubahan prediksi, sinyal."""
     from .config import PREDICT_ASSETS
 
-    _, horizon, _ = TIMEFRAMES[timeframe]
+    horizon = TIMEFRAMES[timeframe].horizon
     preds = store.latest_predictions()
     bt = store.backtests()
     out = []

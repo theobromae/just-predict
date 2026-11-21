@@ -7,17 +7,10 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-FEATURE_VERSION = "tech-v1"
+FEATURE_VERSION = "tech-v2-ta"
 
 
-def _rsi(close: pd.Series, n: int = 14) -> pd.Series:
-    delta = close.diff()
-    up = delta.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
-    down = (-delta.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
-    with np.errstate(divide="ignore", invalid="ignore"):
-        rs = up / down  # down=0 -> inf -> RSI 100
-    rsi = 100 - 100 / (1 + rs)
-    return rsi.where(~((up == 0) & (down == 0)), 50.0).where(delta.notna() | rsi.notna())
+from .technicals import rsi as _rsi, ta_features  # noqa: E402
 
 
 def technical_features(close: pd.Series) -> pd.DataFrame:
@@ -52,12 +45,16 @@ def forward_return(close: pd.Series, horizon: int) -> pd.Series:
 
 
 def build_dataset(close: pd.Series, horizon: int,
-                  extra: pd.DataFrame | None = None) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
+                  extra: pd.DataFrame | None = None,
+                  ohlcv: pd.DataFrame | None = None) -> tuple[pd.DataFrame, pd.Series, pd.DataFrame]:
     """Kembalikan (X_latih, y_latih, X_terbaru).
 
+    `ohlcv` = data harian lengkap untuk fitur analisis teknikal (pola candle, support/resistance, dll.).
     `extra` = fitur tambahan ber-index tanggal (mis. sentimen, fundamental), digabung apa adanya.
     """
     X = technical_features(close)
+    if ohlcv is not None and not ohlcv.empty:
+        X = X.join(ta_features(ohlcv.reindex(close.index)))
     if extra is not None and not extra.empty:
         X = X.join(extra.reindex(X.index).ffill())
     y = forward_return(close, horizon)

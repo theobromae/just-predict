@@ -29,12 +29,20 @@ Setiap kali aplikasi dibuka:
 Saat dibuka, aplikasi langsung menampilkan **grafik** dari data tersimpan, lalu memperbarui data dan
 prediksi di belakang. Satu layar berisi:
 
+- tema gelap, desain flat;
 - daftar aset di kiri, dengan harga terakhir dan perkiraan perubahan;
-- pilihan **Harian / Mingguan / Bulanan** (batang grafik dan prediksi ikut menyesuaikan jangka waktunya);
-- pilihan **Garis / Candle**, indikator **Volume**, **RSI**, **Rata-rata 20/50**, dan titik **Prediksi lalu**
-  (hijau = arah benar, merah = salah);
-- panel kanan berbahasa awam: perkiraan harga dan rentangnya, saran, seberapa bisa dipercaya
-  (akurasi backtest dan akurasi nyata), serta kondisi teknikal saat ini.
+- pilihan **1 Jam / 4 Jam / Harian / Mingguan / Bulanan**. Data per jam dari Yahoo (±2 tahun terakhir),
+  4 jam disusun dari data per jam. Prediksi dibuat mulai harian;
+- **jalur prediksi**: 14 titik (harian), 8 titik (mingguan), 6 titik (bulanan) dengan rentang 80% yang
+  melebar makin jauh ke depan. Atur di `PATH_POINTS` (`engine.py`);
+- pilihan **Garis / Candle**, indikator **Volume**, **RSI**, **MA 20/50**, garis **Support/Resistance**,
+  penanda **pola candle**, dan titik **Prediksi lalu** (hijau = arah benar, merah = salah);
+- panel kanan berbahasa awam: **arah tren** (Bullish/Bearish/Sideways, gabungan model + analisis teknikal),
+  perkiraan harga dan rentangnya, saran, seberapa bisa dipercaya, dan daftar sinyal teknikal.
+
+Analisis teknikal (`technicals.py`) juga menjadi fitur model: jarak ke support/resistance, breakout/breakdown,
+pola candle (hammer, engulfing, shooting star, doji), kemiringan dan divergensi RSI, golden/death cross,
+Bollinger %B, ATR, kemiringan tren, dan rasio volume.
 
 Semua data disimpan di `~/Library/Application Support/JustPredict/justpredict.sqlite`.
 
@@ -48,6 +56,7 @@ Semua data disimpan di `~/Library/Application Support/JustPredict/justpredict.sq
 | `justpredict/models/` | model plug-in: `naive` (baseline) dan `lightgbm` (kuantil + arah) |
 | `justpredict/adaptive.py` | bobot ansambel dan koreksi galat |
 | `justpredict/engine.py` | siklus update → evaluasi → latih → prediksi |
+| `justpredict/technicals.py` | pola candle, support/resistance, sinyal teknikal, fitur TA |
 | `justpredict/viewmodel.py` | data grafik (resample, indikator) dan teks penjelasan |
 | `justpredict/gui/app.py` | aplikasi desktop PySide6 |
 

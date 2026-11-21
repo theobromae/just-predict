@@ -23,10 +23,11 @@ class LightGBMForecaster(Forecaster):
     name = "lightgbm"
     version = "1"
 
-    def __init__(self, recent_weight_halflife: int | None = 504, seed: int = 42):
+    def __init__(self, recent_weight_halflife: int | None = 504, seed: int = 42, n_estimators: int = 300):
         # Bobot sampel menurun eksponensial ke masa lalu: data terbaru lebih berpengaruh.
         self.halflife = recent_weight_halflife
         self.seed = seed
+        self.params = {**_COMMON, "n_estimators": n_estimators}
 
     def _weights(self, n: int) -> np.ndarray | None:
         if not self.halflife:
@@ -40,10 +41,10 @@ class LightGBMForecaster(Forecaster):
         w = self._weights(len(X))
         self.quantile_models_ = {}
         for q in (0.1, 0.5, 0.9):
-            m = lgb.LGBMRegressor(objective="quantile", alpha=q, random_state=self.seed, **_COMMON)
+            m = lgb.LGBMRegressor(objective="quantile", alpha=q, random_state=self.seed, **self.params)
             m.fit(X, y, sample_weight=w)
             self.quantile_models_[q] = m
-        self.clf_ = lgb.LGBMClassifier(objective="binary", random_state=self.seed, **_COMMON)
+        self.clf_ = lgb.LGBMClassifier(objective="binary", random_state=self.seed, **self.params)
         self.clf_.fit(X, (y > 0).astype(int), sample_weight=w)
         return self
 

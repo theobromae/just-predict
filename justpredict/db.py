@@ -15,6 +15,14 @@ CREATE TABLE IF NOT EXISTS prices (
     PRIMARY KEY (asset, date)
 );
 
+-- Harga per jam. ts = detik epoch UTC (awal batang).
+CREATE TABLE IF NOT EXISTS prices_intraday (
+    asset TEXT NOT NULL,
+    ts    INTEGER NOT NULL,
+    open REAL, high REAL, low REAL, close REAL NOT NULL, volume REAL,
+    PRIMARY KEY (asset, ts)
+);
+
 -- Satu baris per (aset, tanggal dasar, horizon, model).
 -- model = nama anggota ansambel, atau 'ensemble' untuk hasil gabungan final.
 CREATE TABLE IF NOT EXISTS predictions (
@@ -102,6 +110,37 @@ class Store:
         self.conn.commit()
         return len(rows)
 
+    # ---------- harga per jam ----------
+    def upsert_intraday(self, asset: str, df: pd.DataFrame) -> int:
+        """`df` ber-index waktu (tz-aware, atau naive = UTC) dengan kolom open/high/low/close/volume."""
+        if df is None or df.empty:
+            return 0
+        df = df.dropna(subset=["close"])
+        idx = pd.DatetimeIndex(df.index)
+        idx = idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
+        ts = (idx.as_unit("ns").asi8 // 10**9).astype("int64")
+        f = lambda v: None if v is None or pd.isna(v) else float(v)
+        rows = [(asset, int(t), f(r.open), f(r.high), f(r.low), float(r.close), f(getattr(r, "volume", None)))
+                for t, r in zip(ts, df.itertuples())]
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO prices_intraday(asset, ts, open, high, low, close, volume) "
+            "VALUES (?,?,?,?,?,?,?)", rows)
+        self.conn.commit()
+        return len(rows)
+
+    def last_intraday_ts(self, asset: str) -> int | None:
+        return self.conn.execute("SELECT MAX(ts) FROM prices_intraday WHERE asset=?", (asset,)).fetchone()[0]
+
+    def intraday(self, asset: str) -> pd.DataFrame:
+        """OHLCV per jam, index waktu UTC (tz-aware)."""
+        df = pd.read_sql_query(
+            "SELECT ts, open, high, low, close, volume FROM prices_intraday WHERE asset=? ORDER BY ts",
+            self.conn, params=(asset,))
+        df.index = pd.to_datetime(df.pop("ts"), unit="s", utc=True)
+        for c in ("open", "high", "low"):
+            df[c] = df[c].fillna(df["close"])
+        return df
+
     def missing_ohlc(self, asset: str) -> bool:
         """True kalau banyak baris belum punya OHLC (database dari versi lama)."""
         row = self.conn.execute(
@@ -168,14 +207,14 @@ class Store:
         q += " ORDER BY p.base_date"
         return pd.read_sql_query(q, self.conn, params=params)
 
-    def latest_predictions(self) -> pd.DataFrame:
+    def latest_predictions(self, model: str = "ensemble") -> pd.DataFrame:
         return pd.read_sql_query(
             "SELECT p.* FROM predictions p JOIN ("
-            "  SELECT asset, horizon, MAX(base_date) AS bd FROM predictions WHERE model='ensemble' "
+            "  SELECT asset, horizon, MAX(base_date) AS bd FROM predictions WHERE model=? "
             "  GROUP BY asset, horizon) m "
             "ON p.asset=m.asset AND p.horizon=m.horizon AND p.base_date=m.bd "
-            "WHERE p.model='ensemble' ORDER BY p.asset, p.horizon",
-            self.conn,
+            "WHERE p.model=? ORDER BY p.asset, p.horizon",
+            self.conn, params=(model, model),
         )
 
     # ---------- backtest ----------

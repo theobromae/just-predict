@@ -11,16 +11,22 @@ import pandas as pd
 
 from . import adaptive
 from .config import ASSET_BY_KEY, HORIZONS, PREDICT_ASSETS
-from .data.prices import PriceSource, update_all
+from .data.prices import PriceSource, update_all, update_intraday
 from .db import Store
 from .features import FEATURE_VERSION, build_dataset
 from .models import make_models
+from .models.gbm import LightGBMForecaster
 
 log = logging.getLogger(__name__)
 
 MIN_TRAIN_ROWS = 300
 BACKTEST_FRACTION = 0.2
-ENGINE_VERSION = "0.1.0"
+ENGINE_VERSION = "0.2.0"
+
+# Jalur prediksi: (jarak antar titik dalam hari bursa, jumlah titik) per tampilan.
+PATH_POINTS: dict[str, tuple[int, int]] = {"harian": (1, 14), "mingguan": (5, 8), "bulanan": (21, 6)}
+# Horizon yang benar-benar dilatih; titik di antaranya diinterpolasi.
+PATH_ANCHORS: list[int] = [3, 10, 14, 20, 30, 40, 42, 63, 126]
 
 
 @dataclass
@@ -86,7 +92,7 @@ def predict_asset(store: Store, asset: str, horizon: int, model_names: list[str]
     close = store.prices(asset)
     if len(close) < MIN_TRAIN_ROWS:
         return False
-    X, y, X_latest = build_dataset(close, horizon, extra_features)
+    X, y, X_latest = build_dataset(close, horizon, extra_features, store.ohlcv(asset))
     if len(X) < MIN_TRAIN_ROWS or X_latest.empty:
         return False
     base_date = X_latest.index[-1]
@@ -132,12 +138,37 @@ def predict_asset(store: Store, asset: str, horizon: int, model_names: list[str]
     return True
 
 
+def predict_path_anchor(store: Store, asset: str, horizon: int) -> bool:
+    """Prediksi titik jalur (model LightGBM ringan, tanpa backtest) + koreksi galat dari riwayatnya sendiri."""
+    close = store.prices(asset)
+    if len(close) < MIN_TRAIN_ROWS + horizon:
+        return False
+    X, y, X_latest = build_dataset(close, horizon, None, store.ohlcv(asset))
+    if len(X) < MIN_TRAIN_ROWS or X_latest.empty:
+        return False
+    base_date = X_latest.index[-1]
+    m = LightGBMForecaster(n_estimators=150).fit(X, y)
+    raw = m.predict(X_latest).iloc[0]
+    final = adaptive.error_correction(store.evaluated(asset, horizon, "path")).apply(raw)
+    store.save_prediction(
+        asset=asset, base_date=base_date.strftime("%Y-%m-%d"), horizon=horizon, model="path",
+        base_price=float(close.loc[base_date]), p_up=float(raw.p_up), q10=float(final.q10),
+        q50=float(final.q50), q90=float(final.q90), raw_q50=float(raw.q50),
+        model_version=f"path-{ENGINE_VERSION}/{FEATURE_VERSION}",
+    )
+    return True
+
+
 def run_cycle(store: Store, source: PriceSource | None = None, fetch: bool = True,
               assets: list[str] | None = None, model_names: list[str] | None = None,
-              progress: Callable[[str], None] = lambda m: None) -> CycleReport:
+              progress: Callable[[str], None] = lambda m: None, with_path: bool = True) -> CycleReport:
     report = CycleReport()
     if fetch:
         report.updated = update_all(store, source, progress)
+        try:
+            update_intraday(store, source, progress)
+        except Exception:
+            log.exception("Gagal memperbarui data per jam")
     progress("Mengevaluasi prediksi sebelumnya…")
     report.evaluated = evaluate_matured(store)
     for asset in assets or PREDICT_ASSETS:
@@ -153,5 +184,12 @@ def run_cycle(store: Store, source: PriceSource | None = None, fetch: bool = Tru
                 report.predicted += 1
             else:
                 report.skipped.append(f"{asset}/{label}")
+        if with_path:
+            progress(f"Menyusun jalur prediksi {ASSET_BY_KEY[asset].name}…")
+            for h in PATH_ANCHORS:
+                try:
+                    predict_path_anchor(store, asset, h)
+                except Exception:
+                    log.exception("Gagal jalur %s h=%s", asset, h)
     progress("Selesai.")
     return report
