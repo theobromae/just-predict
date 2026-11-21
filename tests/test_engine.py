@@ -392,3 +392,11 @@ def test_fundamentals_news_and_trend_details(store):
     assert any(h.startswith("Fundamental") for h in heads) and any(h.startswith("Sentimen berita: positif") for h in heads)
     assert "link" in kinds and kinds[-1] == "total"
     assert s.sentiment.direction == 1 and s.reports
+    # Fundamental tidak mengubah angka harga: median/rentang sama dengan model tanpa fundamental.
+    import re
+    ens = store.latest_predictions("ensemble")
+    row = ens[(ens.asset == "TLKM") & (ens.horizon == 1)].iloc[0]
+    shift = float(re.search(r"fund_shift=([+-][0-9.]+)", row.model_version).group(1))
+    assert abs(shift) <= 0.10 + 1e-9 and s.fund_shift == pytest.approx(shift, abs=1e-3)
+    bt = store.backtests()
+    assert bt[bt.model == "lightgbm_fund"].logloss.notna().all()

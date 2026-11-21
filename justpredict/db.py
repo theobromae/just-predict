@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS backtests (
     hit_rate   REAL NOT NULL,
     mae_ret    REAL NOT NULL,
     coverage   REAL NOT NULL,
+    logloss    REAL,              -- ketepatan peluang naik (makin kecil makin baik)
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (asset, horizon, model)
 );
@@ -124,6 +125,8 @@ class Store:
         for c in ("open", "high", "low", "volume"):
             if c not in cols:
                 self.conn.execute(f"ALTER TABLE prices ADD COLUMN {c} REAL")
+        if "logloss" not in {r[1] for r in self.conn.execute("PRAGMA table_info(backtests)")}:
+            self.conn.execute("ALTER TABLE backtests ADD COLUMN logloss REAL")
         self.conn.commit()
 
     def close(self) -> None:
@@ -261,11 +264,11 @@ class Store:
 
     # ---------- backtest ----------
     def save_backtest(self, asset: str, horizon: int, model: str, n: int,
-                      hit_rate: float, mae_ret: float, coverage: float) -> None:
+                      hit_rate: float, mae_ret: float, coverage: float, logloss: float | None = None) -> None:
         self.conn.execute(
-            "INSERT OR REPLACE INTO backtests(asset, horizon, model, n, hit_rate, mae_ret, coverage) "
-            "VALUES (?,?,?,?,?,?,?)",
-            (asset, horizon, model, n, hit_rate, mae_ret, coverage),
+            "INSERT OR REPLACE INTO backtests(asset, horizon, model, n, hit_rate, mae_ret, coverage, logloss) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (asset, horizon, model, n, hit_rate, mae_ret, coverage, logloss),
         )
         self.conn.commit()
 

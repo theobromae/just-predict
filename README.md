@@ -61,8 +61,9 @@ Bollinger %B, ATR, kemiringan tren, dan rasio volume.
 - Semua angka dicatat sejak tanggal **dianggap terbit** (kuartal +45 hari, tahunan +90 hari, data bulanan
   +45 hari), jadi model tidak memakai angka sebelum publik bisa melihatnya. Penanda **L** di grafik saham
   menunjukkan perkiraan tanggal terbit itu.
-- Fitur fundamental **hanya dipakai model kalau di uji data lama tidak memperburuk** arah dan galat
-  (backtest `lightgbm_fund` vs `lightgbm_base`). Hasil keputusan ini tampil di rincian skor.
+- Fundamental **tidak mengubah angka harga** (median dan rentang tetap dari model teknikal). Fundamental
+  hanya **menggeser peluang naik**, paling banyak 10 poin (`MAX_FUND_SHIFT`), dan hanya kalau di uji data lama
+  peluangnya jadi lebih tepat (log loss `lightgbm_fund` < `lightgbm_base`). Geseran tampil di kartu Perkiraan.
 - **Sentimen berita** (`data/news.py`): judul dari Google News RSS, dinilai dengan kamus kata keuangan
   Indonesia/Inggris plus negasi. Karena RSS hanya berisi beberapa minggu, sentimen dipakai di skor Arah
   Tren, belum sebagai fitur model.

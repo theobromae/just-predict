@@ -941,6 +941,9 @@ class MainWindow(QMainWindow):
             bar.setStyleSheet(f"QProgressBar::chunk {{ background: {UP if s.p_up >= 0.5 else DOWN}; }}")
             self.card_pred.body.addWidget(bar)
             self.card_pred.label(s.lines["p_up"].split(": ", 1)[-1].capitalize(), "muted")
+            if s.fund_shift:
+                self.card_pred.label(f"Termasuk geseran {s.fund_shift * 100:+.0f} poin dari fundamental "
+                                     f"(model teknikal saja: {pct(s.p_up - s.fund_shift)}).", "faint")
             self.card_pred.label(s.lines["as_of"], "faint")
         else:
             self.card_pred.label(s.name, "muted")

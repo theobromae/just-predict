@@ -23,7 +23,9 @@ log = logging.getLogger(__name__)
 
 MIN_TRAIN_ROWS = 300
 BACKTEST_FRACTION = 0.2
-ENGINE_VERSION = "0.2.0"
+ENGINE_VERSION = "0.3.0"
+# Fundamental tidak mengubah angka harga; ia hanya menggeser peluang naik, paling banyak sebesar ini.
+MAX_FUND_SHIFT = 0.10
 
 # Jalur prediksi: (jarak antar titik dalam hari bursa, jumlah titik) per tampilan.
 PATH_POINTS: dict[str, tuple[int, int]] = {"harian": (1, 14), "mingguan": (5, 8), "bulanan": (21, 6),
@@ -100,7 +102,10 @@ def _backtest(model_factory, X: pd.DataFrame, y: pd.Series, horizon: int) -> dic
     m = model_factory().fit(X.iloc[:train_end], y.iloc[:train_end])
     p = m.predict(X.iloc[split:])
     yt = y.iloc[split:]
+    pu = p["p_up"].clip(0.01, 0.99).to_numpy()
+    up = (yt > 0).to_numpy()
     return {
+        "logloss": float(-np.mean(np.where(up, np.log(pu), np.log(1 - pu)))),
         "n": len(yt),
         "hit_rate": float(((p["p_up"] > 0.5) == (yt > 0)).mean()),
         "mae_ret": float((yt - p["q50"]).abs().mean()),
@@ -121,18 +126,20 @@ def predict_asset(store: Store, asset: str, horizon: int, model_names: list[str]
     base_price = float(close.loc[base_date])
     base_str = base_date.strftime("%Y-%m-%d")
 
-    # Fitur fundamental hanya dipakai kalau di uji data lama membuat LightGBM lebih baik.
-    use_extra = False
-    if extra_features is not None and not extra_features.empty and "x_" in "".join(X.columns):
-        base_cols = [c for c in X.columns if not c.startswith("x_")]
-        with_x = _backtest(LightGBMForecaster, X, y, horizon)
-        without = _backtest(LightGBMForecaster, X[base_cols], y, horizon)
+    # Angka harga (rentang dan median) selalu dari model tanpa fundamental. Fundamental hanya boleh
+    # menggeser peluang naik, dan hanya kalau di uji data lama terbukti membuat peluang lebih tepat
+    # (log loss lebih kecil).
+    base_cols = [c for c in X.columns if not c.startswith("x_")]
+    X_full, X_full_latest = X, X_latest
+    X, X_latest = X[base_cols], X_latest[base_cols]
+    use_fund = False
+    if len(base_cols) < len(X_full.columns):
+        with_x = _backtest(LightGBMForecaster, X_full, y, horizon)
+        without = _backtest(LightGBMForecaster, X, y, horizon)
         if with_x and without:
             store.save_backtest(asset, horizon, "lightgbm_fund", **with_x)
             store.save_backtest(asset, horizon, "lightgbm_base", **without)
-            use_extra = with_x["hit_rate"] >= without["hit_rate"] and with_x["mae_ret"] <= without["mae_ret"]
-        if not use_extra:
-            X, X_latest = X[base_cols], X_latest[base_cols]
+            use_fund = with_x["logloss"] < without["logloss"]
 
     models = make_models(model_names)
     member_preds: dict[str, pd.Series] = {}
@@ -163,13 +170,19 @@ def predict_asset(store: Store, asset: str, horizon: int, model_names: list[str]
     correction = adaptive.error_correction(store.evaluated(asset, horizon, "ensemble"))
     final = correction.apply(combined)
 
+    fund_shift = 0.0
+    if use_fund:
+        p_fund = float(LightGBMForecaster().fit(X_full, y).predict(X_full_latest).iloc[0].p_up)
+        p_base = float(member_preds["lightgbm"].p_up) if "lightgbm" in member_preds else p_fund
+        fund_shift = float(np.clip(p_fund - p_base, -MAX_FUND_SHIFT, MAX_FUND_SHIFT))
+
     store.save_prediction(
         asset=asset, base_date=base_str, horizon=horizon, model="ensemble", base_price=base_price,
-        p_up=float(np.clip(final.p_up, 0, 1)), q10=float(final.q10), q50=float(final.q50),
+        p_up=float(np.clip(final.p_up + fund_shift, 0.01, 0.99)), q10=float(final.q10), q50=float(final.q50),
         q90=float(final.q90), raw_q50=float(combined.q50),
         model_version=(f"ensemble-{ENGINE_VERSION} w=" + ",".join(f"{k}:{v:.2f}" for k, v in weights.items())
                        + f" bias={correction.bias:+.4f} scale={correction.width_scale:.2f}"
-                       + f" fund={int(use_extra)}"),
+                       + f" fund_shift={fund_shift:+.3f}"),
     )
     return True
 

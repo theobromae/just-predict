@@ -5,6 +5,7 @@ Modul ini tidak bergantung pada Qt supaya mudah dites.
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -134,6 +135,7 @@ class Summary:
     fundamental: Assessment | None = None
     sentiment: Sentiment | None = None
     fund_used: str = ""          # penjelasan apakah fundamental ikut dipakai model
+    fund_shift: float = 0.0      # geseran peluang naik dari fundamental (sudah termasuk di p_up)
     reports: list[pd.Timestamp] = field(default_factory=list)  # perkiraan tanggal terbit laporan keuangan
 
 
@@ -241,7 +243,7 @@ def _pts(v: int) -> str:
 
 
 def _trend(path: pd.DataFrame, ta: TAResult | None, fund: Assessment | None = None,
-           senti: Sentiment | None = None, fund_used: str = "") -> tuple[str, int, str, list[tuple[str, str, str]]]:
+           senti: Sentiment | None = None, fund_used: str = "", fund_shift: float = 0.0) -> tuple[str, int, str, list[tuple[str, str, str]]]:
     """Arah tren = model ML + analisis teknikal + fundamental/makro + sentimen berita.
 
     Setiap kelompok menyumbang +1 (naik), 0, atau −1 (turun). Total −4..+4 menentukan label.
@@ -261,8 +263,6 @@ def _trend(path: pd.DataFrame, ta: TAResult | None, fund: Assessment | None = No
                           f"peluang naik {pct(end.p_up)}", _pts(model_dir)))
     else:
         d.append(("item", "Belum ada prediksi", "0"))
-    if fund_used:
-        d.append(("note", fund_used, ""))
     # 2. Teknikal
     score = ta.score if ta else 0
     ta_dir = 1 if score >= 2 else -1 if score <= -2 else 0
@@ -282,6 +282,11 @@ def _trend(path: pd.DataFrame, ta: TAResult | None, fund: Assessment | None = No
         d.append(("item", "Data fundamental belum tersedia (diambil saat pembaruan)", "0"))
     for n in (fund.notes if fund else []):
         d.append(("note", n, ""))
+    if fund_shift:
+        d.append(("note", f"Peluang naik di kartu Perkiraan sudah termasuk geseran "
+                          f"{fund_shift * 100:+.0f} poin dari fundamental.", ""))
+    if fund_used:
+        d.append(("note", fund_used, ""))
     # 4. Sentimen berita
     s_dir = senti.direction if senti else 0
     if senti and senti.n:
@@ -334,12 +339,16 @@ def _fund_used(bt: pd.DataFrame, asset: str, horizon: int) -> str:
     if bt.empty:
         return ""
     sel = bt[(bt.asset == asset) & (bt.horizon == horizon)].set_index("model")
-    if "lightgbm_fund" not in sel.index or "lightgbm_base" not in sel.index:
+    if "lightgbm_fund" not in sel.index or "lightgbm_base" not in sel.index or "logloss" not in sel:
         return ""
-    f, b = sel.hit_rate["lightgbm_fund"], sel.hit_rate["lightgbm_base"]
-    if f >= b and sel.mae_ret["lightgbm_fund"] <= sel.mae_ret["lightgbm_base"]:  # aturan sama dengan engine
-        return f"Data fundamental ikut dipakai model (uji data lama: arah benar {pct(f)} vs {pct(b)} tanpa)."
-    return f"Data fundamental tidak dipakai model karena tidak menambah akurasi ({pct(f)} vs {pct(b)} tanpa)."
+    lf, lb = sel.logloss["lightgbm_fund"], sel.logloss["lightgbm_base"]
+    if pd.isna(lf) or pd.isna(lb):
+        return ""
+    if lf < lb:  # aturan sama dengan engine
+        return ("Fundamental boleh menggeser peluang naik (maks. 10 poin): di uji data lama, peluang jadi "
+                "lebih tepat. Angka harga tetap dari model teknikal.")
+    return ("Fundamental tidak menggeser peluang naik: di uji data lama tidak membuat peluang lebih tepat. "
+            "Fundamental tetap dihitung di Arah Tren.")
 
 
 def summarize(store: Store, asset: str, timeframe: str, cd: pd.DataFrame | None = None) -> Summary:
@@ -367,6 +376,8 @@ def summarize(store: Store, asset: str, timeframe: str, cd: pd.DataFrame | None 
         s.high = r.base_price * math.exp(r.q90)
         s.change_pct = math.exp(r.q50) - 1
         s.p_up = float(r.p_up)
+        m = re.search(r"fund_shift=([+-][0-9.]+)", str(r.get("model_version") or ""))
+        s.fund_shift = float(m.group(1)) if m else 0.0
         s.proven = is_proven(bt, asset, horizon, bt_model, bt_naive)
         s.signal = signal(s.p_up, r.q50) if s.proven else "TAHAN"
         s.target_date = _target(tf, r.base_date)
@@ -427,7 +438,7 @@ def summarize(store: Store, asset: str, timeframe: str, cd: pd.DataFrame | None 
     s.reports = report_dates(store, asset)
     s.fund_used = _fund_used(bt, asset, horizon) if not tf.intraday else ""
     s.trend, s.trend_level, s.lines["trend_why"], s.trend_details = _trend(
-        s.path, s.ta, s.fundamental, s.sentiment, s.fund_used)
+        s.path, s.ta, s.fundamental, s.sentiment, s.fund_used, s.fund_shift)
     if not s.path.empty:
         end = s.path.iloc[-1]
         chg = end["mid"] / s.path.attrs["base_price"] - 1
