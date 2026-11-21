@@ -26,5 +26,7 @@ pyinstaller --noconfirm --clean --windowed \
   packaging/launcher.py
 
 ./dist/JustPredict.app/Contents/MacOS/JustPredict selftest
+# Buka jendela aplikasi hasil build dengan data sintetis, coba semua tampilan, lalu tutup.
+./dist/JustPredict.app/Contents/MacOS/JustPredict gui-smoke
 (cd dist && ditto -c -k --keepParent JustPredict.app JustPredict-macos-arm64.zip)
 echo "Selesai: dist/JustPredict.app dan dist/JustPredict-macos-arm64.zip"

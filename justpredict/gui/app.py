@@ -299,13 +299,15 @@ class Card(QFrame):
 
 # ---------------------------------------------------------------- jendela utama
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, autostart: bool = True):
         super().__init__()
         self.setWindowTitle(f"JustPredict {__version__}")
         self.resize(1440, 900)
         self.setStyleSheet(STYLE)
         self.store = Store(db_path())
-        self.settings = QSettings("JustPredict", "JustPredict")
+        import os
+        # Folder data khusus (tes/CI) memakai pengaturan terpisah agar pilihan pengguna tidak tertimpa.
+        self.settings = QSettings("JustPredict", "JustPredict-test" if os.environ.get("JUSTPREDICT_HOME") else "JustPredict")
         self._thread: QThread | None = None
         self._cd = pd.DataFrame()
         self._x = np.array([])
@@ -428,7 +430,8 @@ class MainWindow(QMainWindow):
         self.type_group.buttonToggled.connect(lambda b, on: on and self.refresh_chart())
 
         self.refresh_asset_list(select=self.settings.value("asset", None))
-        self.start_cycle(fetch=True)
+        if autostart:
+            self.start_cycle(fetch=True)
 
     # ------------------------------------------------------------ util widget
     def _segmented(self, layout, options) -> QButtonGroup:
@@ -530,6 +533,13 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------ grafik
     def refresh_chart(self):
+        try:
+            self._refresh_chart()
+        except Exception:
+            logging.getLogger("justpredict.gui").exception("Gagal menggambar grafik")
+            self.status.setText("Grafik gagal digambar untuk pilihan ini. Detail ada di log.")
+
+    def _refresh_chart(self):
         asset = self.current_asset()
         for p in (self.price_plot, self.vol_plot, self.rsi_plot):
             p.clear()
@@ -768,12 +778,48 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
-def main() -> int:
-    logging.basicConfig(level=logging.INFO)
-    app = QApplication.instance() or QApplication(sys.argv)
+def make_app() -> QApplication:
+    app = QApplication.instance() or QApplication(sys.argv[:1])
     app.setApplicationName("JustPredict")
     app.setStyle("Fusion")  # gaya seragam di macOS agar tema gelap terbaca jelas
     app.setPalette(dark_palette())
-    win = MainWindow()
+    return app
+
+
+def show_error(title: str, details: str) -> None:
+    from PySide6.QtWidgets import QMessageBox
+
+    from ..applog import log_file
+    box = QMessageBox()
+    box.setIcon(QMessageBox.Critical)
+    box.setWindowTitle("JustPredict")
+    box.setText(title)
+    box.setInformativeText(f"Log tersimpan di:\n{log_file()}")
+    box.setDetailedText(details)
+    box.exec()
+
+
+def _excepthook(exc_type, exc, tb):
+    text = "".join(traceback.format_exception(exc_type, exc, tb))
+    logging.getLogger("justpredict.gui").error("Error tak tertangani:\n%s", text)
+    try:
+        show_error("Terjadi kesalahan. Aplikasi tetap berjalan, tapi tampilan mungkin tidak lengkap.", text)
+    except Exception:
+        pass
+
+
+def main() -> int:
+    log = logging.getLogger("justpredict.gui")
+    app = make_app()
+    sys.excepthook = _excepthook  # error di dalam slot Qt tidak lagi menutup aplikasi diam-diam
+    try:
+        win = MainWindow()
+    except Exception:
+        text = traceback.format_exc()
+        log.error("Gagal membuka jendela:\n%s", text)
+        show_error("Aplikasi gagal dibuka.", text)
+        return 1
     win.show()
+    win.raise_()
+    win.activateWindow()
     return app.exec()

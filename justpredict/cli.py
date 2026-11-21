@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sys
 
 import pandas as pd
 
@@ -21,12 +22,20 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("show", help="Tampilkan prediksi terakhir")
     sub.add_parser("gui", help="Buka aplikasi desktop")
     sub.add_parser("selftest", help="Uji cepat tanpa internet (dipakai CI setelah build)")
-    args = parser.parse_args(argv)
+    sub.add_parser("gui-smoke", help="Buka jendela dengan data sintetis lalu tutup (dipakai CI)")
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # macOS kadang menambahkan argumen seperti "-psn_0_12345" saat aplikasi dibuka dari Finder.
+    # Abaikan semua argumen yang tidak dikenal agar aplikasi tidak langsung keluar.
+    args, _unknown = parser.parse_known_args([a for a in argv if not a.startswith("-psn")])
 
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    from .applog import setup_logging
+    setup_logging()
     if args.cmd in (None, "gui"):
         from .gui.app import main as gui_main
         return gui_main()
+    if args.cmd == "gui-smoke":
+        from .gui.smoke import run as smoke
+        return smoke()
 
     if args.cmd == "selftest":
         return selftest()

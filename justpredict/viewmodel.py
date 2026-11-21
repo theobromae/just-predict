@@ -176,7 +176,8 @@ def _technical_text(cd: pd.DataFrame) -> list[str]:
         out.append(f"Harga {rel} rata-rata 50 periode: cenderung {trend}.")
     vol = cd["volume"].dropna()
     if len(vol) > 20:
-        ratio = vol.iloc[-1] / vol.iloc[-21:-1].mean()
+        base = vol.iloc[-21:-1].mean()
+        ratio = vol.iloc[-1] / base if base > 0 else 1.0
         if ratio > 1.5:
             out.append(f"Volume transaksi {dec(ratio)}× rata-rata: sedang ramai.")
         elif ratio < 0.6:
@@ -188,20 +189,27 @@ def forecast_path(store: Store, asset: str, path_key: str) -> pd.DataFrame:
     """Titik-titik prediksi ke depan. Horizon yang tidak dilatih langsung diinterpolasi."""
     step, n = PATH_POINTS[path_key]
     ens, path = store.latest_predictions("ensemble"), store.latest_predictions("path")
-    rows = pd.concat([ens[ens.asset == asset], path[path.asset == asset]]) if not ens.empty else ens
+    parts = [df[df.asset == asset] for df in (ens, path) if not df.empty]
+    parts = [p for p in parts if not p.empty]
+    if not parts:
+        return pd.DataFrame()
+    rows = pd.concat(parts, ignore_index=True)
+    num = ["horizon", "base_price", "p_up", "q10", "q50", "q90"]
+    rows[num] = rows[num].apply(pd.to_numeric, errors="coerce")  # pastikan float, bukan object
+    rows = rows.dropna(subset=num)
     if rows.empty:
         return pd.DataFrame()
     base_date = rows.base_date.max()
     rows = rows[rows.base_date == base_date].sort_values("horizon").drop_duplicates("horizon", keep="first")
     base = float(rows.base_price.iloc[0])
-    hs = np.r_[0, rows.horizon.values]
+    hs = np.r_[0.0, rows.horizon.to_numpy(dtype=float)]
     out = []
     for k in range(1, n + 1):
         h = step * k
         if h > hs.max():
             break
-        q = {c: float(np.interp(h, hs, np.r_[0.0, rows[c].values])) for c in ("q10", "q50", "q90")}
-        p_up = float(np.interp(h, hs, np.r_[0.5, rows.p_up.values]))
+        q = {c: float(np.interp(h, hs, np.r_[0.0, rows[c].to_numpy(dtype=float)])) for c in ("q10", "q50", "q90")}
+        p_up = float(np.interp(h, hs, np.r_[0.5, rows.p_up.to_numpy(dtype=float)]))
         lo, mid, hi = sorted([q["q10"], q["q50"], q["q90"]])
         out.append({"h": h, "date": pd.Timestamp(base_date) + pd.offsets.BDay(h),
                     "mid": base * math.exp(mid), "lo": base * math.exp(lo),

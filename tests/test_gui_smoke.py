@@ -47,3 +47,8 @@ def test_chart_window_all_modes(tmp_path, monkeypatch):
     win.deleteLater()
     qapp.processEvents()
     del win
+
+
+def test_gui_smoke_command(monkeypatch):
+    from justpredict.gui.smoke import run
+    assert run() == 0

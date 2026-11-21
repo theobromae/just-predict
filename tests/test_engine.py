@@ -258,3 +258,15 @@ def test_close_only_prices_still_predict(store):
     store.upsert_prices("WTI", pd.Series(100 * np.exp(np.cumsum(np.random.default_rng(0).normal(0, 0.01, 700))), index=idx))
     assert store.ohlcv("WTI").dtypes.eq(float).all()
     assert predict_asset(store, "WTI", 1)
+
+
+def test_path_with_only_old_ensemble_predictions(store):
+    """Database dari versi sebelumnya: ada prediksi ensemble, belum ada jalur. Tidak boleh error."""
+    from justpredict.viewmodel import forecast_path, summarize
+    src = FakeSource(days=700)
+    run_cycle(store, src, assets=["WTI"], with_path=False)
+    path = forecast_path(store, "WTI", "harian")
+    assert len(path) == 14  # anchor 1, 5, 21 dari ensemble
+    assert path.mid.dtype == float
+    summarize(store, "WTI", "harian")
+    summarize(store, "WTI", "1jam")
