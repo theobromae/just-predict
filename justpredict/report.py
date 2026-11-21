@@ -26,14 +26,15 @@ def signal(p_up: float, q50: float) -> str:
 MIN_HIT_RATE = 0.52
 
 
-def is_proven(bt: pd.DataFrame, asset: str, horizon: int) -> bool:
+def is_proven(bt: pd.DataFrame, asset: str, horizon: int,
+              model: str = "lightgbm", baseline: str = "naive") -> bool:
     """Model dianggap teruji kalau di backtest arahnya benar >= 52% dan mengalahkan baseline naif."""
     if bt.empty:
         return False
     sel = bt[(bt.asset == asset) & (bt.horizon == horizon)].set_index("model")["hit_rate"]
-    if "lightgbm" not in sel:
+    if model not in sel:
         return False
-    return sel["lightgbm"] >= MIN_HIT_RATE and sel["lightgbm"] > sel.get("naive", 0.5)
+    return sel[model] >= MIN_HIT_RATE and sel[model] > sel.get(baseline, 0.5)
 
 
 def latest_table(store: Store) -> pd.DataFrame:

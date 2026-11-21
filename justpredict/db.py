@@ -67,6 +67,17 @@ CREATE TABLE IF NOT EXISTS backtests (
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (asset, horizon, model)
 );
+
+-- Gambar pengguna di grafik (garis tren, kotak, Fibonacci, dll.), per aset.
+-- points = JSON [[detik epoch, harga], ...] agar tetap di tempatnya di semua tampilan waktu.
+CREATE TABLE IF NOT EXISTS drawings (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset      TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    points     TEXT NOT NULL,
+    text       TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -231,3 +242,31 @@ class Store:
 
     def backtests(self) -> pd.DataFrame:
         return pd.read_sql_query("SELECT * FROM backtests ORDER BY asset, horizon, model", self.conn)
+
+    # ---------- gambar pengguna ----------
+    def drawings(self, asset: str) -> list[dict]:
+        import json
+        rows = self.conn.execute("SELECT id, kind, points, text FROM drawings WHERE asset=? ORDER BY id",
+                                 (asset,)).fetchall()
+        return [{"id": i, "kind": k, "points": json.loads(p), "text": t} for i, k, p, t in rows]
+
+    def save_drawing(self, asset: str, kind: str, points: list, text: str | None = None,
+                     drawing_id: int | None = None) -> int:
+        import json
+        pts = json.dumps([[float(x), float(y)] for x, y in points])
+        if drawing_id is None:
+            cur = self.conn.execute("INSERT INTO drawings(asset, kind, points, text) VALUES (?,?,?,?)",
+                                    (asset, kind, pts, text))
+            drawing_id = int(cur.lastrowid)
+        else:
+            self.conn.execute("UPDATE drawings SET points=?, text=? WHERE id=?", (pts, text, drawing_id))
+        self.conn.commit()
+        return drawing_id
+
+    def delete_drawing(self, drawing_id: int) -> None:
+        self.conn.execute("DELETE FROM drawings WHERE id=?", (drawing_id,))
+        self.conn.commit()
+
+    def clear_drawings(self, asset: str) -> None:
+        self.conn.execute("DELETE FROM drawings WHERE asset=?", (asset,))
+        self.conn.commit()

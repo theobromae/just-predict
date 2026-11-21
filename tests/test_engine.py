@@ -234,6 +234,40 @@ def test_intraday_and_path(store):
     s = summarize(store, "WTI", "harian")
     assert s.trend in {"Bullish", "Cenderung bullish", "Sideways", "Cenderung bearish", "Bearish", "Belum jelas"}
     assert s.ta is not None
+    assert s.trend_details and s.trend_details[0][0].startswith("Model ML")
+    # Prediksi per jam: 8 titik untuk 1 jam, horizon dalam batang.
+    p1 = forecast_path(store, "WTI", "1jam")
+    assert list(p1.h) == list(range(1, 9)) and p1.attrs["intraday"]
+    s1 = summarize(store, "WTI", "1jam")
+    assert s1.has_prediction and "1 jam lagi" in s1.lines["headline"]
+    bt = store.backtests()
+    assert {"intra_1jam_lgbm", "intra_1jam_naive"} <= set(bt.model)
+    # Satu siklus lagi dengan data per jam baru: prediksi per jam yang lama dievaluasi.
+    src.advance(2)
+    run_cycle(store, src, assets=["WTI"], with_path=False)
+    assert len(store.evaluated("WTI", 1, "intra_1jam")) > 0
+
+
+def test_drawings_persist_and_index_mapping(tmp_path):
+    from justpredict.gui.drawings import index_mapping
+    db = tmp_path / "d.sqlite"
+    s = Store(db)
+    did = s.save_drawing("WTI", "trend", [(1.7e9, 70.0), (1.7e9 + 86400, 72.5)])
+    s.save_drawing("WTI", "text", [(1.7e9, 71.0)], "beli di sini")
+    s.save_drawing("BTC", "hline", [(1.7e9, 90000.0)])
+    s.save_drawing("WTI", "trend", [(1.7e9, 60.0), (1.7e9 + 86400, 61.0)], drawing_id=did)
+    s.close()
+    s = Store(db)  # dibuka ulang: gambar tetap ada
+    d = s.drawings("WTI")
+    assert [x["kind"] for x in d] == ["trend", "text"] and d[0]["points"][0][1] == 60.0
+    assert d[1]["text"] == "beli di sini"
+    s.delete_drawing(d[1]["id"])
+    s.clear_drawings("BTC")
+    assert len(s.drawings("WTI")) == 1 and s.drawings("BTC") == []
+    to_x, from_x = index_mapping(np.array([0.0, 3600, 7200, 90000]))
+    assert to_x(3600) == 1 and to_x(5400) == 1.5 and to_x(90000 + 7200) == 5
+    for x in (-2.0, 0.5, 2.7, 6.0):
+        assert abs(to_x(from_x(x)) - x) < 1e-9
 
 
 def test_technicals_detect_patterns():

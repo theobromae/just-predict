@@ -10,6 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 def test_chart_window_all_modes(tmp_path, monkeypatch):
     monkeypatch.setenv("JUSTPREDICT_HOME", str(tmp_path))
+    monkeypatch.setenv("JUSTPREDICT_NO_DIALOG", "1")
     from tests.test_engine import FakeSource
     from justpredict.config import db_path
     from justpredict.db import Store
@@ -43,6 +44,36 @@ def test_chart_window_all_modes(tmp_path, monkeypatch):
                 type_btn.setChecked(True)
                 win.refresh_chart()
     win.grab().save(str(tmp_path / "shot.png"))
+
+    # Alat gambar: garis tren di WTI harian tersimpan dan muncul lagi setelah jendela dibuka ulang.
+    for row in range(win.asset_list.count()):
+        if win.asset_list.item(row).data(0x0100) == "WTI":
+            win.asset_list.setCurrentRow(row)
+    win._check(win.tf_group, "harian")
+    win.refresh_chart()
+    x = win._x
+    y = float(win._cd.close.iloc[-1])
+    win.drawings.set_tool("trend")
+    win.drawings.click_at(x[-30], y)
+    win.drawings.click_at(x[-1], y * 1.02)
+    win.drawings.set_tool("fib")
+    win.drawings.click_at(x[-20], y)
+    win.drawings.click_at(x[-5], y * 0.97)
+    win.drawings.set_tool("hline")
+    win.drawings.click_at(x[-10], y)
+    assert win.drawings.tool == "select" and win.drawings.count() == 3
+    win._check(win.tf_group, "1jam")  # gambar ikut tampil di mode per jam
+    assert win.drawings.count() == 3
+    win.close()
+    win.deleteLater()
+    qapp.processEvents()
+    del win
+
+    win = gui.MainWindow()
+    assert len(Store(db_path()).drawings("WTI")) == 3
+    assert win.current_asset() == "WTI" and win.drawings.count() == 3
+    win._clear_drawings()
+    assert win.drawings.count() == 0
     win.close()
     win.deleteLater()
     qapp.processEvents()

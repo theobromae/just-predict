@@ -32,13 +32,19 @@ prediksi di belakang. Satu layar berisi:
 - tema gelap, desain flat;
 - daftar aset di kiri, dengan harga terakhir dan perkiraan perubahan;
 - pilihan **1 Jam / 4 Jam / Harian / Mingguan / Bulanan**. Data per jam dari Yahoo (±2 tahun terakhir),
-  4 jam disusun dari data per jam. Prediksi dibuat mulai harian;
-- **jalur prediksi**: 14 titik (harian), 8 titik (mingguan), 6 titik (bulanan) dengan rentang 80% yang
-  melebar makin jauh ke depan. Atur di `PATH_POINTS` (`engine.py`);
-- pilihan **Garis / Candle**, indikator **Volume**, **RSI**, **MA 20/50**, garis **Support/Resistance**,
-  penanda **pola candle**, dan titik **Prediksi lalu** (hijau = arah benar, merah = salah);
-- panel kanan berbahasa awam: **arah tren** (Bullish/Bearish/Sideways, gabungan model + analisis teknikal),
-  perkiraan harga dan rentangnya, saran, seberapa bisa dipercaya, dan daftar sinyal teknikal.
+  4 jam disusun dari data per jam;
+- **jalur prediksi**: 8 titik (1 jam), 10 titik (4 jam), 14 titik (harian), 8 titik (mingguan),
+  6 titik (bulanan) dengan rentang 80% yang melebar makin jauh ke depan. Atur di `PATH_POINTS` (`engine.py`).
+  Model per jam dilatih terpisah (`INTRADAY` di `engine.py`) dan juga dievaluasi serta dikoreksi dari galatnya;
+- pilihan **Garis / Candle**, menu **Indikator ▾**: Volume, RSI, MA 20/50, Support/Resistance, dan titik
+  Prediksi lalu (hijau = arah benar, merah = salah), plus penanda **pola candle**;
+- **alat gambar** di kiri grafik: garis tren, garis horizontal, kotak, Fibonacci retracement, catatan teks,
+  dan penghapus. Gambar disimpan per aset di database (tabel `drawings`), tetap ada setelah aplikasi ditutup,
+  dan ikut tampil di semua tampilan waktu. Tekan Esc untuk membatalkan;
+- panel kanan berbahasa awam: **arah tren** (Bullish/Bearish/Sideways, gabungan model + analisis teknikal)
+  dengan dropdown **Rincian skor**, perkiraan harga dan rentangnya, saran, seberapa bisa dipercaya, dan
+  daftar sinyal teknikal;
+- ukuran jendela mengikuti layar, dan batas antara daftar aset, grafik, dan panel kanan bisa digeser.
 
 Analisis teknikal (`technicals.py`) juga menjadi fitur model: jarak ke support/resistance, breakout/breakdown,
 pola candle (hammer, engulfing, shooting star, doji), kemiringan dan divergensi RSI, golden/death cross,

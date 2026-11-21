@@ -11,7 +11,7 @@ import pandas as pd
 
 from . import adaptive
 from .config import ASSET_BY_KEY, HORIZONS, PREDICT_ASSETS
-from .data.prices import PriceSource, update_all, update_intraday
+from .data.prices import PriceSource, intraday_local, update_all, update_intraday
 from .db import Store
 from .features import FEATURE_VERSION, build_dataset
 from .models import make_models
@@ -24,9 +24,21 @@ BACKTEST_FRACTION = 0.2
 ENGINE_VERSION = "0.2.0"
 
 # Jalur prediksi: (jarak antar titik dalam hari bursa, jumlah titik) per tampilan.
-PATH_POINTS: dict[str, tuple[int, int]] = {"harian": (1, 14), "mingguan": (5, 8), "bulanan": (21, 6)}
+PATH_POINTS: dict[str, tuple[int, int]] = {"harian": (1, 14), "mingguan": (5, 8), "bulanan": (21, 6),
+                                           "1jam": (1, 8), "4jam": (1, 10)}
 # Horizon yang benar-benar dilatih; titik di antaranya diinterpolasi.
 PATH_ANCHORS: list[int] = [3, 10, 14, 20, 30, 40, 42, 63, 126]
+
+# Prediksi per jam: aturan resample, horizon yang dilatih (dalam jumlah batang), panjang batang (jam).
+INTRADAY: dict[str, tuple[str | None, list[int], int]] = {
+    "1jam": (None, [1, 2, 4, 8], 1),
+    "4jam": ("4h", [1, 2, 5, 10], 4),
+}
+MIN_INTRADAY_ROWS = 400
+
+
+def intraday_model(key: str) -> str:
+    return f"intra_{key}"
 
 
 @dataclass
@@ -44,7 +56,15 @@ def evaluate_matured(store: Store) -> int:
     count = 0
     price_cache: dict[str, pd.Series] = {}
     for row in pending.itertuples():
-        prices = price_cache.setdefault(row.asset, store.prices(row.asset))
+        if row.model.startswith("intra_"):
+            key = row.model.removeprefix("intra_")
+            ck = f"{row.asset}|{key}"
+            if ck not in price_cache:
+                df = intraday_local(store, row.asset, INTRADAY[key][0]) if key in INTRADAY else pd.DataFrame()
+                price_cache[ck] = df["close"] if not df.empty else pd.Series(dtype=float)
+            prices = price_cache[ck]
+        else:
+            prices = price_cache.setdefault(row.asset, store.prices(row.asset))
         after = prices.loc[prices.index > pd.Timestamp(row.base_date)]
         if len(after) < row.horizon:
             continue  # belum jatuh tempo
@@ -55,7 +75,7 @@ def evaluate_matured(store: Store) -> int:
         raw_q50 = row.raw_q50 if row.raw_q50 is not None and not pd.isna(row.raw_q50) else row.q50
         store.save_evaluation(
             prediction_id=int(row.id),
-            target_date=target_date.strftime("%Y-%m-%d"),
+            target_date=target_date.strftime("%Y-%m-%d %H:%M" if row.model.startswith("intra_") else "%Y-%m-%d"),
             actual_price=actual,
             actual_ret=actual_ret,
             error=actual_ret - row.q50,
@@ -159,9 +179,44 @@ def predict_path_anchor(store: Store, asset: str, horizon: int) -> bool:
     return True
 
 
+def predict_intraday(store: Store, asset: str, key: str) -> bool:
+    """Prediksi per jam / 4 jam: model LightGBM per horizon (dalam batang) + koreksi galat sendiri.
+
+    Backtest horizon 1 batang dibandingkan dengan tebakan naif untuk menilai keandalan.
+    """
+    rule, anchors, _ = INTRADAY[key]
+    df = intraday_local(store, asset, rule)
+    if len(df) < MIN_INTRADAY_ROWS:
+        return False
+    close = df["close"]
+    name = intraday_model(key)
+    from .models import NaiveForecaster
+    for h in anchors:
+        X, y, X_latest = build_dataset(close, h, None, df)
+        if len(X) < MIN_INTRADAY_ROWS // 2 or X_latest.empty:
+            return False
+        factory = lambda: LightGBMForecaster(n_estimators=150, recent_weight_halflife=2000)
+        if h == 1:
+            for label, fac in (("lgbm", factory), ("naive", NaiveForecaster)):
+                bt = _backtest(fac, X, y, h)
+                if bt:
+                    store.save_backtest(asset, h, f"{name}_{label}", **bt)
+        raw = factory().fit(X, y).predict(X_latest).iloc[0]
+        final = adaptive.error_correction(store.evaluated(asset, h, name)).apply(raw)
+        base_ts = X_latest.index[-1]
+        store.save_prediction(
+            asset=asset, base_date=base_ts.strftime("%Y-%m-%d %H:%M"), horizon=h, model=name,
+            base_price=float(close.loc[base_ts]), p_up=float(raw.p_up), q10=float(final.q10),
+            q50=float(final.q50), q90=float(final.q90), raw_q50=float(raw.q50),
+            model_version=f"{name}-{ENGINE_VERSION}/{FEATURE_VERSION}",
+        )
+    return True
+
+
 def run_cycle(store: Store, source: PriceSource | None = None, fetch: bool = True,
               assets: list[str] | None = None, model_names: list[str] | None = None,
-              progress: Callable[[str], None] = lambda m: None, with_path: bool = True) -> CycleReport:
+              progress: Callable[[str], None] = lambda m: None, with_path: bool = True,
+              with_intraday: bool = True) -> CycleReport:
     report = CycleReport()
     if fetch:
         report.updated = update_all(store, source, progress)
@@ -191,5 +246,12 @@ def run_cycle(store: Store, source: PriceSource | None = None, fetch: bool = Tru
                     predict_path_anchor(store, asset, h)
                 except Exception:
                     log.exception("Gagal jalur %s h=%s", asset, h)
+        if with_intraday:
+            for key in INTRADAY:
+                progress(f"Melatih model per jam {ASSET_BY_KEY[asset].name} ({key})…")
+                try:
+                    predict_intraday(store, asset, key)
+                except Exception:
+                    log.exception("Gagal prediksi per jam %s %s", asset, key)
     progress("Selesai.")
     return report

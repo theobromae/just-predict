@@ -14,18 +14,19 @@ import numpy as np
 import pandas as pd
 import pyqtgraph as pg
 from PySide6.QtCore import QObject, QPointF, QRectF, QSettings, Qt, QThread, Signal
-from PySide6.QtGui import QColor, QPainter, QPalette, QPicture
+from PySide6.QtGui import QAction, QColor, QGuiApplication, QPainter, QPalette, QPicture
 from PySide6.QtWidgets import (
-    QApplication, QButtonGroup, QCheckBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QListWidget,
-    QListWidgetItem, QMainWindow, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
-    QSizePolicy, QVBoxLayout, QWidget,
+    QApplication, QButtonGroup, QFrame, QGridLayout, QHBoxLayout, QLabel, QListWidget,
+    QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
+    QScrollArea, QSizePolicy, QSplitter, QToolButton, QVBoxLayout, QWidget,
 )
 
 from .. import __version__
 from ..config import ASSET_BY_KEY, db_path
 from ..db import Store
 from ..engine import run_cycle
-from ..viewmodel import TIMEFRAMES, asset_list, chart_data, dec, local_tz, money, pct, summarize
+from ..viewmodel import TIMEFRAMES, TREND_RULES, asset_list, chart_data, dec, local_tz, money, pct, summarize
+from .drawings import TOOLS, DrawingLayer, index_mapping
 
 # ---------------------------------------------------------------- palet (flat, gelap)
 BG = "#0f1115"
@@ -72,6 +73,18 @@ QPushButton[seg="true"]:checked {{ background: {ACCENT}; color: white; }}
 QPushButton[segFirst="true"] {{ border-top-left-radius: 8px; border-bottom-left-radius: 8px; }}
 QPushButton[segLast="true"] {{ border-top-right-radius: 8px; border-bottom-right-radius: 8px; }}
 QPushButton#flat {{ background: transparent; color: {MUTED}; }}
+QToolButton {{ background: {SURFACE}; border: none; border-radius: 8px; padding: 6px 10px; color: {TEXT}; }}
+QToolButton:hover {{ background: {SURFACE_2}; }}
+QToolButton::menu-indicator {{ image: none; width: 0; }}
+QToolButton#tool {{ min-width: 34px; max-width: 34px; min-height: 30px; padding: 0; font-size: 14px; }}
+QToolButton#tool:checked {{ background: {ACCENT}; color: white; }}
+QToolButton#expander {{ background: transparent; color: {MUTED}; padding: 2px 0; text-align: left; }}
+QToolButton#expander:hover {{ color: {TEXT}; }}
+QMenu {{ background: {SURFACE_2}; border: 1px solid {BORDER}; padding: 6px; border-radius: 8px; }}
+QMenu::item {{ padding: 6px 18px 6px 10px; border-radius: 6px; }}
+QMenu::item:selected {{ background: {SURFACE}; }}
+QMenu::indicator {{ width: 14px; height: 14px; }}
+QSplitter::handle {{ background: transparent; }}
 QCheckBox {{ color: {MUTED}; spacing: 6px; }}
 QCheckBox::indicator {{ width: 14px; height: 14px; border-radius: 4px; background: {SURFACE_2}; }}
 QCheckBox::indicator:checked {{ background: {ACCENT}; }}
@@ -113,7 +126,7 @@ class DateAxis(pg.DateAxisItem):
     sehingga jam malam dan akhir pekan tidak meninggalkan celah kosong.
     """
 
-    labels: pd.DatetimeIndex | None = None
+    labels: list[str] | None = None
 
     def tickValues(self, minVal, maxVal, size):
         if self.labels is None:
@@ -128,7 +141,7 @@ class DateAxis(pg.DateAxisItem):
             out = []
             for v in values:
                 i = int(round(v))
-                out.append(self.labels[i].strftime("%d %b %H:%M") if 0 <= i < len(self.labels) else "")
+                out.append(self.labels[i] if 0 <= i < len(self.labels) else "")
             return out
         if spacing < 86400:
             fmt = "%d %b %H:%M"
@@ -302,8 +315,8 @@ class MainWindow(QMainWindow):
     def __init__(self, autostart: bool = True):
         super().__init__()
         self.setWindowTitle(f"JustPredict {__version__}")
-        self.resize(1440, 900)
         self.setStyleSheet(STYLE)
+        self.setMinimumSize(960, 600)
         self.store = Store(db_path())
         import os
         # Folder data khusus (tes/CI) memakai pengaturan terpisah agar pilihan pengguna tidak tertimpa.
@@ -311,44 +324,57 @@ class MainWindow(QMainWindow):
         self._thread: QThread | None = None
         self._cd = pd.DataFrame()
         self._x = np.array([])
+        self._trend_open = self.settings.value("trend_details_open", False, type=bool)
 
         root = QWidget()
         root.setObjectName("root")
         outer = QHBoxLayout(root)
         outer.setContentsMargins(12, 12, 12, 8)
-        outer.setSpacing(12)
+        outer.setSpacing(0)
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(12)
+        outer.addWidget(splitter)
+        self.splitter = splitter
 
         # ---- kiri: daftar aset
         self.asset_list = QListWidget()
-        self.asset_list.setFixedWidth(240)
+        self.asset_list.setMinimumWidth(170)
+        self.asset_list.setMaximumWidth(260)
         self.asset_list.currentItemChanged.connect(lambda *_: self.refresh_chart())
-        outer.addWidget(self.asset_list)
+        splitter.addWidget(self.asset_list)
 
         # ---- tengah: toolbar + grafik
-        center = QVBoxLayout()
+        center_w = QWidget()
+        center = QVBoxLayout(center_w)
+        center.setContentsMargins(0, 0, 0, 0)
         center.setSpacing(8)
         bar = QHBoxLayout()
         bar.setSpacing(0)
         self.tf_group = self._segmented(bar, [(tf.label, k) for k, tf in TIMEFRAMES.items()])
-        bar.addSpacing(14)
+        bar.addSpacing(10)
         self.type_group = self._segmented(bar, [("Garis", "line"), ("Candle", "candle")])
-        bar.addSpacing(14)
-        self.cb_volume = QCheckBox("Volume")
-        self.cb_rsi = QCheckBox("RSI")
-        self.cb_ma = QCheckBox("MA 20/50")
-        self.cb_sr = QCheckBox("Support/Resistance")
-        self.cb_past = QCheckBox("Prediksi lalu")
-        for cb in (self.cb_volume, self.cb_rsi, self.cb_ma, self.cb_sr, self.cb_past):
-            cb.setChecked(True)
-            cb.toggled.connect(lambda *_: self.refresh_chart())
-            bar.addWidget(cb)
-            bar.addSpacing(10)
-        self.cb_rsi.setToolTip("RSI mengukur kecepatan naik/turun harga. Di atas 70 = jenuh beli, di bawah 30 = jenuh jual.")
-        self.cb_ma.setToolTip("Rata-rata harga 20 dan 50 batang terakhir. Harga di atas garis = tren naik.")
-        self.cb_sr.setToolTip("Support = level yang sering menahan harga turun. Resistance = level yang sering menahan harga naik.")
-        self.cb_past.setToolTip("Titik = prediksi yang sudah jatuh tempo. Hijau arahnya benar, merah salah.")
+        bar.addSpacing(10)
+        # Indikator di menu dropdown agar toolbar tidak memaksa jendela melebar.
+        self.ind_btn = QToolButton()
+        self.ind_btn.setText("Indikator ▾")
+        self.ind_btn.setPopupMode(QToolButton.InstantPopup)
+        menu = QMenu(self.ind_btn)
+        self.cb_volume = self._toggle(menu, "volume", "Volume", "Jumlah transaksi per batang.")
+        self.cb_rsi = self._toggle(menu, "rsi", "RSI",
+                                   "RSI mengukur kecepatan naik/turun harga. Di atas 70 = jenuh beli, di bawah 30 = jenuh jual.")
+        self.cb_ma = self._toggle(menu, "ma", "MA 20/50",
+                                  "Rata-rata harga 20 dan 50 batang terakhir. Harga di atas garis = tren naik.")
+        self.cb_sr = self._toggle(menu, "sr", "Support/Resistance",
+                                  "Support = level yang sering menahan harga turun. Resistance = level yang sering menahan harga naik.")
+        self.cb_past = self._toggle(menu, "past", "Prediksi lalu",
+                                    "Titik = prediksi yang sudah jatuh tempo. Hijau arahnya benar, merah salah.")
+        menu.setToolTipsVisible(True)
+        self.ind_btn.setMenu(menu)
+        bar.addWidget(self.ind_btn)
         bar.addStretch(1)
-        self.refresh_btn = QPushButton("⟳  Perbarui data")
+        self.refresh_btn = QPushButton("⟳  Perbarui")
+        self.refresh_btn.setToolTip("Ambil data terbaru dan latih ulang model")
         self.refresh_btn.clicked.connect(lambda: self.start_cycle(fetch=True))
         bar.addWidget(self.refresh_btn)
         center.addLayout(bar)
@@ -375,10 +401,44 @@ class MainWindow(QMainWindow):
         legend.setBrush(pg.mkBrush(SURFACE + "cc"))
         self.vol_plot.setLabel("left", "Volume")
         self.rsi_plot.setLabel("left", "RSI")
-        center.addWidget(self.price_plot, 4)
-        center.addWidget(self.vol_plot, 1)
-        center.addWidget(self.rsi_plot, 1)
+        # Alat gambar: strip vertikal di kiri grafik (seperti TradingView).
+        chart_row = QHBoxLayout()
+        chart_row.setSpacing(8)
+        tools = QVBoxLayout()
+        tools.setSpacing(4)
+        self.tool_group = QButtonGroup(self)
+        self.tool_group.setExclusive(True)
+        for key, icon, tip in TOOLS:
+            b = QToolButton()
+            b.setObjectName("tool")
+            b.setText(icon)
+            b.setToolTip(tip)
+            b.setCheckable(True)
+            b.setProperty("key", key)
+            self.tool_group.addButton(b)
+            tools.addWidget(b)
+        self.tool_group.buttons()[0].setChecked(True)
+        clear_btn = QToolButton()
+        clear_btn.setObjectName("tool")
+        clear_btn.setText("🗑")
+        clear_btn.setToolTip("Hapus semua gambar di aset ini")
+        clear_btn.clicked.connect(self._clear_drawings)
+        tools.addSpacing(8)
+        tools.addWidget(clear_btn)
+        tools.addStretch(1)
+        chart_row.addLayout(tools)
+        plots = QVBoxLayout()
+        plots.setSpacing(8)
+        plots.addWidget(self.price_plot, 4)
+        plots.addWidget(self.vol_plot, 1)
+        plots.addWidget(self.rsi_plot, 1)
+        chart_row.addLayout(plots, 1)
+        center.addLayout(chart_row, 1)
         self.price_plot.scene().sigMouseMoved.connect(self._on_mouse)
+        self.drawings = DrawingLayer(self.price_plot, self.store)
+        self.tool_group.buttonToggled.connect(
+            lambda b, on: on and self.drawings.tool != b.property("key") and self.drawings.set_tool(b.property("key")))
+        self.drawings.toolChanged.connect(lambda k: self._check(self.tool_group, k))
 
         status_row = QHBoxLayout()
         self.status = QLabel("Memulai…")
@@ -397,8 +457,10 @@ class MainWindow(QMainWindow):
         center.addWidget(self.log)
         disclaimer = QLabel(DISCLAIMER)
         disclaimer.setObjectName("faint")
+        disclaimer.setWordWrap(True)
         center.addWidget(disclaimer)
-        outer.addLayout(center, 1)
+        center_w.setMinimumWidth(440)
+        splitter.addWidget(center_w)
 
         # ---- kanan: kartu penjelasan
         side = QWidget()
@@ -419,9 +481,14 @@ class MainWindow(QMainWindow):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setFixedWidth(350)
-        outer.addWidget(scroll)
+        scroll.setMinimumWidth(280)
+        scroll.setMaximumWidth(460)
+        splitter.addWidget(scroll)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(2, 0)
         self.setCentralWidget(root)
+        self._fit_to_screen()
 
         # ---- pulihkan pilihan terakhir
         self._check(self.tf_group, self.settings.value("timeframe", "harian"))
@@ -434,6 +501,47 @@ class MainWindow(QMainWindow):
             self.start_cycle(fetch=True)
 
     # ------------------------------------------------------------ util widget
+    def _fit_to_screen(self):
+        """Ukuran awal mengikuti layar (maks. 92% lebar, 90% tinggi area yang bisa dipakai), di tengah."""
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is None:
+            self.resize(1280, 800)
+            return
+        geo = screen.availableGeometry()
+        w = min(1500, int(geo.width() * 0.92))
+        h = min(950, int(geo.height() * 0.90))
+        w, h = max(w, min(960, geo.width())), max(h, min(600, geo.height()))
+        self.resize(w, h)
+        self.move(geo.x() + (geo.width() - w) // 2, geo.y() + (geo.height() - h) // 2)
+        side = 340 if w >= 1300 else 300
+        left = 220 if w >= 1300 else 180
+        self.splitter.setSizes([left, max(440, w - side - left - 60), side])
+
+    def _toggle(self, menu: QMenu, key: str, label: str, tip: str) -> QAction:
+        act = QAction(label, menu)
+        act.setCheckable(True)
+        act.setChecked(self.settings.value(f"ind_{key}", True, type=bool))
+        act.setToolTip(tip)
+        act.toggled.connect(lambda on, k=key: (self.settings.setValue(f"ind_{k}", on), self.refresh_chart()))
+        menu.addAction(act)
+        return act
+
+    def _clear_drawings(self):
+        if not self.drawings.count():
+            return
+        import os
+        if not os.environ.get("JUSTPREDICT_NO_DIALOG"):
+            ans = QMessageBox.question(self, "Hapus gambar", "Hapus semua gambar di aset ini?")
+            if ans != QMessageBox.Yes:
+                return
+        self.drawings.clear_all()
+
+    def keyPressEvent(self, ev):
+        if ev.key() == Qt.Key_Escape:
+            self.drawings.set_tool("select")
+            return
+        super().keyPressEvent(ev)
+
     def _segmented(self, layout, options) -> QButtonGroup:
         group = QButtonGroup(self)
         group.setExclusive(True)
@@ -556,6 +664,7 @@ class MainWindow(QMainWindow):
         s = summarize(self.store, asset, tf_key, cd)
         self.render_side(s, tf)
         if cd.empty:
+            self.drawings.set_context(None)
             msg = ("Belum ada data per jam. Data ini diambil saat pembaruan berikutnya."
                    if tf.source == "intraday" else "Belum ada data harga. Tunggu pembaruan selesai.")
             self.hover.setText(msg)
@@ -563,8 +672,13 @@ class MainWindow(QMainWindow):
 
         a = ASSET_BY_KEY[asset]
         index_mode = tf.source == "intraday"
+        labels = None
+        if index_mode:
+            labels = [d.strftime("%d %b %H:%M") for d in cd.index]
+            if not s.path.empty:  # label perkiraan untuk batang ke depan
+                labels += [f"+{int(h * tf.bar_hours)} jam" for h in range(1, int(s.path.h.max()) + 1)]
         for p in (self.price_plot, self.vol_plot, self.rsi_plot):
-            p.getAxis("bottom").labels = cd.index if index_mode else None
+            p.getAxis("bottom").labels = labels
         x = np.arange(len(cd), dtype=float) if index_mode else _ts(cd.index)
         self._x = x
         step = float(np.median(np.diff(x))) if len(x) > 1 else 86400.0
@@ -611,22 +725,35 @@ class MainWindow(QMainWindow):
                 self.price_plot.plot([], [], pen=None, symbol="t1", symbolBrush=UP, symbolPen=None, name="Pola candle")
 
         # ---- prediksi lalu
-        if self.cb_past.isChecked() and tf.source == "daily" and not s.past.empty:
+        if self.cb_past.isChecked() and not s.past.empty:
             past = s.past
-            px = _ts(pd.to_datetime(past.target_date))
+            if index_mode:
+                tgt = pd.DatetimeIndex(pd.to_datetime(past.target_date))
+                pos = cd.index.get_indexer(tgt)
+                past = past[pos >= 0]
+                px = pos[pos >= 0].astype(float)
+            else:
+                px = _ts(pd.to_datetime(past.target_date))
             py = (past.base_price * np.exp(past.q50)).values
             brushes = [pg.mkBrush(UP if h else DOWN) for h in past.direction_hit]
-            self.price_plot.addItem(pg.ScatterPlotItem(px, py, size=6, brush=brushes, pen=pg.mkPen(BG, width=0.5)))
-            self.price_plot.plot([], [], pen=None, symbol="o", symbolBrush=UP, symbolPen=None,
-                                 name="Prediksi lalu (hijau = benar)")
+            if len(past):
+                self.price_plot.addItem(pg.ScatterPlotItem(px, py, size=6, brush=brushes, pen=pg.mkPen(BG, width=0.5)))
+                self.price_plot.plot([], [], pen=None, symbol="o", symbolBrush=UP, symbolPen=None,
+                                     name="Prediksi lalu (hijau = benar)")
 
         # ---- jalur prediksi
         x_end = x[-1]
         if tf.path_key and not s.path.empty:
             path = s.path
-            bx = _ts([path.attrs["base_date"]])[0]
             base = path.attrs["base_price"]
-            px = np.r_[bx, _ts(path.date)]
+            if index_mode:
+                # Posisi batang dasar prediksi; jalur digambar per batang setelahnya.
+                bi = cd.index.get_indexer([path.attrs["base_date"]])[0]
+                bx = float(bi if bi >= 0 else len(cd) - 1)
+                px = np.r_[bx, bx + path.h.to_numpy(dtype=float)]
+            else:
+                bx = _ts([path.attrs["base_date"]])[0]
+                px = np.r_[bx, _ts(path.date)]
             lo = self.price_plot.plot(px, np.r_[base, path.lo.values], pen=pg.mkPen(ACCENT + "88", width=1))
             hi = self.price_plot.plot(px, np.r_[base, path.hi.values], pen=pg.mkPen(ACCENT + "88", width=1))
             self.price_plot.addItem(pg.FillBetweenItem(lo, hi, brush=pg.mkBrush(139, 92, 246, 45)))
@@ -673,6 +800,14 @@ class MainWindow(QMainWindow):
             self.vol_plot.setYRange(0, float(vis.volume.max() or 1), padding=0.05)
         self._show_hover(len(cd) - 1)
 
+        # ---- gambar pengguna (disimpan per aset)
+        if index_mode:
+            to_x, from_x = index_mapping(_ts(cd.index))
+        else:
+            to_x = from_x = None
+        self.drawings.set_context(asset, to_x, from_x, fmt=lambda v: money(v, a.currency))
+        self.drawings.render()
+
     def _on_mouse(self, pos):
         if self._cd.empty or not self.price_plot.sceneBoundingRect().contains(pos):
             return
@@ -708,6 +843,54 @@ class MainWindow(QMainWindow):
         if "path" in s.lines:
             self.card_trend.label(s.lines["path"])
         self.card_trend.label(s.lines.get("trend_why", ""), "faint")
+        if s.trend_details:
+            exp = QToolButton()
+            exp.setObjectName("expander")
+            exp.setCheckable(True)
+            exp.setChecked(self._trend_open)
+            exp.setCursor(Qt.PointingHandCursor)
+            details = QWidget()
+            dv = QVBoxLayout(details)
+            dv.setContentsMargins(0, 4, 0, 0)
+            dv.setSpacing(6)
+            g = QGridLayout()
+            g.setHorizontalSpacing(10)
+            g.setVerticalSpacing(5)
+            n = len(s.trend_details)
+            for i, (text, pts) in enumerate(s.trend_details):
+                summary_row = i >= n - 2  # total teknikal dan arah tren akhir
+                t = QLabel(text)
+                t.setWordWrap(True)
+                t.setStyleSheet(f"color: {TEXT if summary_row else MUTED};" + (" font-weight: 600;" if summary_row else ""))
+                v = QLabel(pts)
+                color = UP if pts.startswith("+") else DOWN if pts.startswith("-") else NEUTRAL
+                v.setStyleSheet(f"color: {color}; font-weight: 700;")
+                v.setAlignment(Qt.AlignRight | Qt.AlignTop)
+                if i == n - 2:
+                    line = QFrame()
+                    line.setFixedHeight(1)
+                    line.setStyleSheet(f"background: {BORDER};")
+                    g.addWidget(line, 2 * i, 0, 1, 2)
+                g.addWidget(t, 2 * i + 1, 0)
+                g.addWidget(v, 2 * i + 1, 1)
+            g.setColumnStretch(0, 1)
+            dv.addLayout(g)
+            rules = QLabel(TREND_RULES)
+            rules.setWordWrap(True)
+            rules.setObjectName("faint")
+            dv.addWidget(rules)
+            details.setVisible(self._trend_open)
+
+            def _toggle(on, b=exp, w=details):
+                self._trend_open = on
+                self.settings.setValue("trend_details_open", on)
+                b.setText(("▾" if on else "▸") + "  Rincian skor")
+                w.setVisible(on)
+
+            _toggle(self._trend_open)
+            exp.toggled.connect(_toggle)
+            self.card_trend.body.addWidget(exp)
+            self.card_trend.body.addWidget(details)
 
         # Perkiraan utama
         if s.has_prediction:
@@ -728,8 +911,6 @@ class MainWindow(QMainWindow):
             bar.setStyleSheet(f"QProgressBar::chunk {{ background: {UP if s.p_up >= 0.5 else DOWN}; }}")
             self.card_pred.body.addWidget(bar)
             self.card_pred.label(s.lines["p_up"].split(": ", 1)[-1].capitalize(), "muted")
-            if tf.source == "intraday":
-                self.card_pred.label("Prediksi tersedia mulai harian; grafik per jam untuk melihat detail.", "faint")
             self.card_pred.label(s.lines["as_of"], "faint")
         else:
             self.card_pred.label(s.name, "muted")

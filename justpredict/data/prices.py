@@ -139,3 +139,21 @@ def update_intraday(store: Store, source: PriceSource | None = None,
             written[asset.key] = store.upsert_intraday(
                 asset.key, gold_idr_per_gram_intraday(store.intraday("GOLD_USD"), store.intraday("USDIDR")))
     return written
+
+
+def local_tz():
+    from datetime import datetime
+    return datetime.now().astimezone().tzinfo
+
+
+def intraday_local(store: Store, asset: str, rule: str | None) -> pd.DataFrame:
+    """OHLCV per jam dalam waktu lokal (naive), opsional di-resample (mis. "4h")."""
+    df = store.intraday(asset)
+    if df.empty:
+        return df
+    df.index = df.index.tz_convert(local_tz()).tz_localize(None)
+    if rule:
+        df = df.resample(rule, origin="start_day").agg(
+            {"open": "first", "high": "max", "low": "min", "close": "last",
+             "volume": lambda s: s.sum(min_count=1)}).dropna(subset=["close"])
+    return df
