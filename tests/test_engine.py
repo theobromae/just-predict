@@ -400,3 +400,46 @@ def test_fundamentals_news_and_trend_details(store):
     assert abs(shift) <= 0.10 + 1e-9 and s.fund_shift == pytest.approx(shift, abs=1e-3)
     bt = store.backtests()
     assert bt[bt.model == "lightgbm_fund"].logloss.notna().all()
+
+
+def test_reconcile_fit_and_apply(store):
+    from justpredict import reconcile
+    # Deret dengan tren halus: semua rentang semestinya sepakat arah, rekonsiliasi bisa membantu.
+    idx = pd.bdate_range("2019-01-01", periods=1500)
+    rng = np.random.default_rng(3)
+    drift = 0.0008 * np.sin(np.arange(1500) / 120)
+    close = pd.Series(100 * np.exp(np.cumsum(drift + rng.normal(0, 0.01, 1500))), index=idx)
+    hold = reconcile.holdout_predictions(close, None, [1, 3, 5, 10, 21])
+    params = reconcile.fit(hold)
+    assert set(params) == {1, 3, 5, 10, 21}
+    for p in params.values():
+        assert p.lam_q in reconcile.LAMBDAS and p.n > 50 and p.weight > 0
+        if p.used:  # hanya dipakai kalau di paruh kedua lebih akurat
+            assert p.mae_recon < p.mae_direct and p.hit_recon >= p.hit_direct - 0.005
+    # Prediksi langsung yang tidak konsisten: rentang 5 hari berlawanan dengan rentang lain.
+    for h, q, pu in ((1, 0.002, 0.6), (3, 0.006, 0.6), (5, -0.02, 0.35), (10, 0.02, 0.62), (21, 0.04, 0.65)):
+        store.save_prediction(asset="WTI", base_date="2024-01-02", horizon=h, model="ensemble" if h in (1, 5, 21) else "path",
+                              base_price=100.0, p_up=pu, q10=q - 0.03, q50=q, q90=q + 0.03, raw_q50=q, model_version="t")
+    forced = {h: reconcile.Params(h, 0.5, 0.5, True, 0.02, 0.019, 0.52, 0.53, 100, 1 / (0.01 * h) ** 2)
+              for h in (1, 3, 5, 10, 21)}
+    assert reconcile.apply_live(store, "WTI", forced) == 5
+    rec = store.latest_predictions("recon").set_index("horizon")
+    assert rec.loc[5, "q50"] > -0.02 and rec.loc[5, "p_up"] > 0.35  # ditarik ke arah bersama
+    assert rec.loc[5, "q90"] - rec.loc[5, "q10"] == pytest.approx(0.06)  # lebar rentang tetap
+
+
+def test_conflict_withholds_signal_and_table(store):
+    from justpredict.viewmodel import _conflict, confidence, forecast_table, main_rows
+    for h, q, pu in ((1, 0.01, 0.7), (5, -0.03, 0.3), (21, 0.05, 0.7)):
+        store.save_prediction(asset="WTI", base_date="2024-01-02", horizon=h, model="ensemble", base_price=100.0,
+                              p_up=pu, q10=q - 0.03, q50=q, q90=q + 0.03, raw_q50=q, model_version="t")
+    main = main_rows(store, "WTI")
+    assert "mingguan" in _conflict(main, 1) and "harian" in _conflict(main, 5)
+    assert confidence(0.65, 0.56) == ("Tinggi", 3)
+    assert confidence(0.65, 0.56, conflict=True) == ("Sedang", 2)
+    assert confidence(0.52, 0.60)[1] == 1 and confidence(0.7, 0.50)[1] == 1
+    assert confidence(0.7, None) == ("Belum teruji", 0)
+    assert confidence(0.35, 0.60, change=0.02)[1] == 1  # median naik tapi peluang bilang turun
+    t = forecast_table(store, "WTI", "harian")
+    assert len(t) == 14 and {"date", "mid", "lo", "hi", "confidence"} <= set(t.columns)
+    assert (t.level <= 2).all()  # ada pertentangan arah: keyakinan maksimal Sedang

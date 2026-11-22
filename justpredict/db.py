@@ -98,6 +98,23 @@ CREATE TABLE IF NOT EXISTS fetch_log (
     fetched_at TEXT NOT NULL
 );
 
+-- Hasil uji rekonsiliasi antar-rentang per aset × rentang (dinilai di paruh kedua data uji).
+CREATE TABLE IF NOT EXISTS reconcile (
+    asset      TEXT NOT NULL,
+    horizon    INTEGER NOT NULL,
+    lam_q      REAL NOT NULL,
+    lam_p      REAL NOT NULL,
+    used       INTEGER NOT NULL,
+    mae_direct REAL NOT NULL,
+    mae_recon  REAL NOT NULL,
+    hit_direct REAL NOT NULL,
+    hit_recon  REAL NOT NULL,
+    n          INTEGER NOT NULL,
+    weight     REAL NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (asset, horizon)
+);
+
 -- Gambar pengguna di grafik (garis tren, kotak, Fibonacci, dll.), per aset.
 -- points = JSON [[detik epoch, harga], ...] agar tetap di tempatnya di semua tampilan waktu.
 CREATE TABLE IF NOT EXISTS drawings (
@@ -351,3 +368,15 @@ class Store:
         self.conn.execute("INSERT OR REPLACE INTO fetch_log(key, fetched_at) VALUES (?, ?)",
                           (key, pd.Timestamp.now(tz="UTC").tz_localize(None).strftime("%Y-%m-%d %H:%M:%S")))
         self.conn.commit()
+
+    # ---------- rekonsiliasi ----------
+    def save_reconcile(self, asset: str, p) -> None:
+        self.conn.execute(
+            "INSERT OR REPLACE INTO reconcile(asset, horizon, lam_q, lam_p, used, mae_direct, mae_recon, "
+            "hit_direct, hit_recon, n, weight) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (asset, p.horizon, p.lam_q, p.lam_p, int(p.used), p.mae_direct, p.mae_recon, p.hit_direct,
+             p.hit_recon, p.n, p.weight))
+        self.conn.commit()
+
+    def reconcile_stats(self, asset: str) -> pd.DataFrame:
+        return pd.read_sql_query("SELECT * FROM reconcile WHERE asset=? ORDER BY horizon", self.conn, params=(asset,))

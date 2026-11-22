@@ -54,6 +54,22 @@ def test_chart_window_all_modes(tmp_path, monkeypatch):
     extra = [w for w in QApplication.topLevelWidgets() if w.isVisible() and w is not win]
     assert extra == [], extra
 
+    # Tampilan tabel prediksi.
+    win._check(win.view_group, "table")
+    for tf in ("harian", "mingguan", "bulanan", "1jam"):
+        win._check(win.tf_group, tf)
+        win.refresh_chart()
+        qapp.processEvents()
+    win._check(win.tf_group, "harian")
+    for row in range(win.asset_list.count()):
+        if win.asset_list.item(row).data(0x0100) == "WTI":
+            win.asset_list.setCurrentRow(row)
+    win.refresh_chart()
+    assert win.stack.currentIndex() == 1 and win.table.rowCount() == 14
+    assert win.table.item(0, 5).text().strip() != ""
+    win._check(win.view_group, "chart")
+    assert win.stack.currentIndex() == 0
+
     # Alat gambar: garis tren di WTI harian tersimpan dan muncul lagi setelah jendela dibuka ulang.
     for row in range(win.asset_list.count()):
         if win.asset_list.item(row).data(0x0100) == "WTI":

@@ -18,14 +18,17 @@ from PySide6.QtGui import QAction, QColor, QGuiApplication, QPainter, QPalette, 
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QFrame, QGridLayout, QHBoxLayout, QLabel, QListWidget,
     QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
-    QScrollArea, QSizePolicy, QSplitter, QToolButton, QVBoxLayout, QWidget,
+    QAbstractItemView, QHeaderView, QScrollArea, QSizePolicy, QSplitter, QStackedWidget, QTableWidget,
+    QTableWidgetItem, QToolButton, QVBoxLayout, QWidget,
 )
 
 from .. import __version__
 from ..config import ASSET_BY_KEY, db_path
 from ..db import Store
 from ..engine import run_cycle
-from ..viewmodel import TIMEFRAMES, TREND_RULES, asset_list, chart_data, dec, local_tz, money, pct, summarize
+from ..viewmodel import (
+    TIMEFRAMES, TREND_RULES, asset_list, chart_data, dec, forecast_table, local_tz, money, pct, summarize, tgl,
+)
 from .drawings import TOOLS, DrawingLayer, index_mapping
 
 # ---------------------------------------------------------------- palet (flat, gelap)
@@ -87,6 +90,12 @@ QMenu::item {{ padding: 6px 18px 6px 10px; border-radius: 6px; }}
 QMenu::item:selected {{ background: {SURFACE}; }}
 QMenu::indicator {{ width: 14px; height: 14px; }}
 QSplitter::handle {{ background: transparent; }}
+QTableWidget {{ background: {SURFACE}; border: none; border-radius: 12px; gridline-color: {BORDER};
+               selection-background-color: {SURFACE_2}; selection-color: {TEXT}; }}
+QTableWidget::item {{ padding: 6px 10px; border-bottom: 1px solid {BORDER}; }}
+QHeaderView::section {{ background: {SURFACE}; color: {FAINT}; border: none; border-bottom: 1px solid {BORDER};
+                        padding: 8px 10px; font-size: 11px; font-weight: 600; }}
+QTableCornerButton::section {{ background: {SURFACE}; border: none; }}
 QCheckBox {{ color: {MUTED}; spacing: 6px; }}
 QCheckBox::indicator {{ width: 14px; height: 14px; border-radius: 4px; background: {SURFACE_2}; }}
 QCheckBox::indicator:checked {{ background: {ACCENT}; }}
@@ -356,6 +365,8 @@ class MainWindow(QMainWindow):
         bar.addSpacing(10)
         self.type_group = self._segmented(bar, [("Garis", "line"), ("Candle", "candle")])
         bar.addSpacing(10)
+        self.view_group = self._segmented(bar, [("Grafik", "chart"), ("Tabel", "table")])
+        bar.addSpacing(10)
         # Indikator di menu dropdown agar toolbar tidak memaksa jendela melebar.
         self.ind_btn = QToolButton()
         self.ind_btn.setText("Indikator ▾")
@@ -439,7 +450,48 @@ class MainWindow(QMainWindow):
         plots.addWidget(self.vol_plot, 1)
         plots.addWidget(self.rsi_plot, 1)
         chart_row.addLayout(plots, 1)
-        center.addLayout(chart_row, 1)
+        chart_page = QWidget()
+        chart_page.setLayout(chart_row)
+        chart_row.setContentsMargins(0, 0, 0, 0)
+        # Tampilan tabel prediksi (bisa ditukar dengan grafik).
+        table_page = QWidget()
+        tv = QVBoxLayout(table_page)
+        tv.setContentsMargins(0, 0, 0, 0)
+        tv.setSpacing(8)
+        self.table_title = QLabel("")
+        self.table_title.setStyleSheet("font-size: 16px; font-weight: 700;")
+        self.table_note = QLabel("")
+        self.table_note.setObjectName("muted")
+        self.table_note.setWordWrap(True)
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(["TANGGAL", "PREDIKSI HARGA", "RENTANG 80%", "PERUBAHAN",
+                                              "PELUANG NAIK", "TINGKAT KEYAKINAN"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setShowGrid(False)
+        self.table.setFocusPolicy(Qt.NoFocus)
+        hdr = self.table.horizontalHeader()
+        hdr.setSectionResizeMode(QHeaderView.Stretch)
+        for col in (0, 2):  # tanggal dan rentang jangan terpotong
+            hdr.setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        hdr.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.table.verticalHeader().setDefaultSectionSize(40)
+        self.table_legend = QLabel(
+            "Tingkat keyakinan menggabungkan seberapa yakin model soal arah (peluang naik/turun) dengan "
+            "rekam jejaknya di rentang itu pada uji data lama. Tinggi: peluang arah ≥ 60% dan terbukti ≥ 54% "
+            "benar. Rendah: peluang arah < 55%, di data lama tidak lebih baik dari tebakan, atau perkiraan harga "
+            "dan peluang naik tidak sepakat arah. Arahkan kursor ke kolom keyakinan untuk alasannya.")
+        self.table_legend.setObjectName("faint")
+        self.table_legend.setWordWrap(True)
+        for w in (self.table_title, self.table_note):
+            tv.addWidget(w)
+        tv.addWidget(self.table, 1)
+        tv.addWidget(self.table_legend)
+        self.stack = QStackedWidget()
+        self.stack.addWidget(chart_page)
+        self.stack.addWidget(table_page)
+        center.addWidget(self.stack, 1)
         # Info harga di bawah kursor diperbarui maks. 30×/detik.
         self._mouse_proxy = pg.SignalProxy(self.price_plot.scene().sigMouseMoved, rateLimit=30,
                                            slot=lambda ev: self._on_mouse(ev[0]))
@@ -506,6 +558,8 @@ class MainWindow(QMainWindow):
         self._check(self.type_group, self.settings.value("chart_type", "candle"))
         self.tf_group.buttonToggled.connect(self._on_tf)
         self.type_group.buttonToggled.connect(lambda b, on: on and self.refresh_chart())
+        self._check(self.view_group, self.settings.value("view", "chart"))
+        self.view_group.buttonToggled.connect(lambda b, on: on and self.refresh_chart())
 
         self.refresh_asset_list(select=self.settings.value("asset", None))
         if autostart:
@@ -577,6 +631,10 @@ class MainWindow(QMainWindow):
     @property
     def timeframe(self) -> str:
         return self.tf_group.checkedButton().property("key")
+
+    @property
+    def view(self) -> str:
+        return self.view_group.checkedButton().property("key")
 
     @property
     def chart_type(self) -> str:
@@ -724,6 +782,16 @@ class MainWindow(QMainWindow):
         self._cd = cd
         s = summarize(self.store, asset, tf_key, cd)
         self.render_side(s, tf)
+        table_mode = self.view == "table"
+        self.settings.setValue("view", self.view)
+        self.stack.setCurrentIndex(1 if table_mode else 0)
+        self.hover.setVisible(not table_mode)
+        for b in self.type_group.buttons():
+            b.setEnabled(not table_mode)
+        if table_mode:
+            self.drawings.set_context(None)
+            self._fill_table(asset, tf_key, tf, s)
+            return
         if cd.empty:
             self.drawings.set_context(None)
             msg = ("Belum ada data per jam. Data ini diambil saat pembaruan berikutnya."
@@ -886,6 +954,48 @@ class MainWindow(QMainWindow):
         self.drawings.set_context(asset, to_x, from_x, fmt=lambda v: money(v, a.currency))
         self.drawings.render()
 
+    def _fill_table(self, asset: str, tf_key: str, tf, s):
+        a = ASSET_BY_KEY[asset]
+        df = forecast_table(self.store, asset, tf_key)
+        self.table.setRowCount(0)
+        if df.empty:
+            self.table_title.setText(f"{a.name} · prediksi {tf.label.lower()}")
+            self.table_note.setText("Belum ada prediksi untuk tampilan ini. Prediksi dibuat saat pembaruan berikutnya.")
+            return
+        base_date, base = df.attrs["base_date"], df.attrs["base_price"]
+        def fmt_date(d):
+            return tgl(d, day=tf.intraday or tf_key == "harian", time=tf.intraday)
+        self.table_title.setText(f"{a.name} · prediksi {tf.label.lower()}, {len(df)} titik ke depan")
+        note = (f"Harga terakhir {money(base, a.currency)} ({fmt_date(base_date)}). "
+                + ("Tanggal per jam adalah perkiraan; jam bursa tutup tidak dihitung. " if tf.intraday else "")
+                + ("Angka sudah diselaraskan antar-rentang. " if s.reconciled else "")
+                + (f"Perhatian: arah antar-rentang bertentangan ({s.conflict}). " if s.conflict else ""))
+        self.table_note.setText(note)
+        self.table.setRowCount(len(df))
+        level_color = {0: FAINT, 1: AMBER, 2: SKY, 3: UP}
+        for i, r in enumerate(df.itertuples()):
+            color = UP if r.change > 0 else DOWN if r.change < 0 else NEUTRAL
+            arrow = "▲" if r.change > 0 else "▼" if r.change < 0 else "◆"
+            cells = [
+                (fmt_date(r.date), TEXT, False),
+                (money(r.mid, a.currency), TEXT, True),
+                (f"{money(r.lo, a.currency)} – {money(r.hi, a.currency)}", MUTED, False),
+                (f"{arrow} {dec(abs(r.change) * 100)}%", color, True),
+                (pct(r.p_up), UP if r.p_up >= 0.55 else DOWN if r.p_up <= 0.45 else MUTED, False),
+                (("●" * r.level + "○" * (3 - r.level) + "  " if r.level else "") + r.confidence,
+                 level_color[r.level], True),
+            ]
+            for j, (text, c, bold) in enumerate(cells):
+                it = QTableWidgetItem(text)
+                it.setForeground(QColor(c))
+                if bold:
+                    f = it.font()
+                    f.setBold(True)
+                    it.setFont(f)
+                if j == 5:
+                    it.setToolTip(r.why)
+                self.table.setItem(i, j, it)
+
     def _on_mouse(self, pos):
         if self._cd.empty or not self.price_plot.sceneBoundingRect().contains(pos):
             return
@@ -1009,6 +1119,8 @@ class MainWindow(QMainWindow):
             if s.fund_shift:
                 self.card_pred.label(f"Termasuk geseran {s.fund_shift * 100:+.0f} poin dari fundamental "
                                      f"(model teknikal saja: {pct(s.p_up - s.fund_shift)}).", "faint")
+            if s.lines.get("recon") and s.reconciled:
+                self.card_pred.label("Diselaraskan dengan prediksi rentang lain.", "faint")
             self.card_pred.label(s.lines["as_of"], "faint")
         else:
             self.card_pred.label(s.name, "muted")
@@ -1035,6 +1147,11 @@ class MainWindow(QMainWindow):
             self.card_rel.rows(rows)
         if s.past.empty:
             self.card_rel.label("Akurasi nyata muncul setelah aplikasi dipakai beberapa hari.", "faint")
+        if s.lines.get("recon"):
+            self.card_rel.label(s.lines["recon"], "faint")
+        if s.conflict:
+            self.card_rel.label(f"Keandalan diturunkan: arah antar-rentang bertentangan ({s.conflict}).",
+                                color=AMBER)
         self.card_rel.label("Patokan: arah benar 52–56% sudah tergolong bagus untuk harga pasar.", "faint")
 
         # Sinyal teknikal

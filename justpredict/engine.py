@@ -18,6 +18,7 @@ from .db import Store
 from .features import FEATURE_VERSION, build_dataset
 from .models import make_models
 from .models.gbm import LightGBMForecaster
+from .reconcile import reconcile_asset
 
 log = logging.getLogger(__name__)
 
@@ -287,6 +288,11 @@ def run_cycle(store: Store, source: PriceSource | None = None, fetch: bool = Tru
                     predict_path_anchor(store, asset, h)
                 except Exception:
                     log.exception("Gagal jalur %s h=%s", asset, h)
+            progress(f"Menyelaraskan prediksi antar-rentang {ASSET_BY_KEY[asset].name}…")
+            try:
+                reconcile_asset(store, asset, sorted(set(HORIZONS.values()) | set(PATH_ANCHORS)), ENGINE_VERSION)
+            except Exception:
+                log.exception("Gagal rekonsiliasi %s", asset)
         if with_intraday:
             for key in INTRADAY:
                 progress(f"Melatih model per jam {ASSET_BY_KEY[asset].name} ({key})…")

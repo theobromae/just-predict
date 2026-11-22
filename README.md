@@ -70,6 +70,19 @@ Bollinger %B, ATR, kemiringan tren, dan rasio volume.
 - **Arah Tren** = 4 kelompok (model ML, teknikal, fundamental/makro, sentimen), masing-masing +1/0/−1.
   Rinciannya, termasuk judul berita yang bisa diklik, ada di dropdown **Rincian skor**.
 
+### Gabungan prediksi multi-rentang dan tampilan tabel
+
+- `reconcile.py` menyelaraskan prediksi semua rentang harian (1–126 hari bursa) ke satu arah dasar
+  bersama (laju return μ·h dan sinyal s·√h), dengan bobot 1/galat² tiap rentang dari uji data lama.
+  λ (campuran prediksi langsung vs arah bersama) dipilih di paruh pertama data uji, lalu dinilai di paruh
+  kedua; penyelarasan hanya dipakai di rentang yang galatnya lebih kecil dan arahnya tidak lebih buruk.
+  Hasilnya disimpan sebagai model `recon` dan dievaluasi seperti prediksi lain.
+- Kalau arah harian, mingguan, dan bulanan jelas berlawanan, saran menjadi TAHAN dan keandalan turun satu
+  tingkat.
+- Tombol **Grafik / Tabel** menukar layar tengah dengan tabel prediksi: tanggal, prediksi harga, rentang
+  80%, perubahan, peluang naik, dan tingkat keyakinan (Tinggi/Sedang/Rendah), mengikuti pilihan
+  1 Jam/4 Jam/Harian/Mingguan/Bulanan.
+
 Semua data disimpan di `~/Library/Application Support/JustPredict/justpredict.sqlite`.
 
 ## Struktur

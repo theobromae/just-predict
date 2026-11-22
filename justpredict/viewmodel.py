@@ -58,6 +58,21 @@ PATH_TEXT = {"harian": "14 hari bursa ke depan (±3 minggu)", "mingguan": "8 min
 
 
 # ------------------------------------------------------------------ format
+HARI = ["Sen", "Sel", "Rab", "Kam", "Jum", "Sab", "Min"]
+BULAN = ["Jan", "Feb", "Mar", "Apr", "Mei", "Jun", "Jul", "Agu", "Sep", "Okt", "Nov", "Des"]
+
+
+def tgl(ts, day: bool = False, time: bool = False) -> str:
+    """Tanggal berbahasa Indonesia, mis. 'Sen, 24 Nov 2026 14:00'."""
+    t = pd.Timestamp(ts)
+    out = f"{t.day:02d} {BULAN[t.month - 1]} {t.year}"
+    if day:
+        out = f"{HARI[t.dayofweek]}, {out}"
+    if time:
+        out += f" {t:%H:%M}"
+    return out
+
+
 def money(v: float | None, currency: str) -> str:
     if v is None or (isinstance(v, float) and math.isnan(v)):
         return "–"
@@ -132,6 +147,8 @@ class Summary:
     trend_level: int = 0         # +2 bullish, +1 cenderung bullish, 0, -1, -2 bearish
     # Rincian skor Arah Tren: (jenis, teks, poin). jenis: "head", "item", "link", "note", "total".
     trend_details: list[tuple[str, str, str]] = field(default_factory=list)
+    reconciled: bool = False     # angka sudah diselaraskan dengan rentang lain
+    conflict: str = ""           # penjelasan kalau arah antar-rentang bertentangan
     fundamental: Assessment | None = None
     sentiment: Sentiment | None = None
     fund_used: str = ""          # penjelasan apakah fundamental ikut dipakai model
@@ -204,6 +221,11 @@ def forecast_path(store: Store, asset: str, path_key: str) -> pd.DataFrame:
     parts = [store.latest_predictions(m) for m in models]
     parts = [df[df.asset == asset] for df in parts if not df.empty]
     parts = [p for p in parts if not p.empty]
+    if not intraday:  # pakai hasil rekonsiliasi antar-rentang kalau sudah ada untuk tanggal terbaru
+        rec = store.latest_predictions("recon")
+        rec = rec[rec.asset == asset] if not rec.empty else rec
+        if len(rec) and (not parts or rec.base_date.max() >= max(p.base_date.max() for p in parts)):
+            parts = [rec]
     if not parts:
         return pd.DataFrame()
     rows = pd.concat(parts, ignore_index=True)
@@ -351,6 +373,43 @@ def _fund_used(bt: pd.DataFrame, asset: str, horizon: int) -> str:
             "Fundamental tetap dihitung di Arah Tren.")
 
 
+def main_rows(store: Store, asset: str) -> dict[int, object]:
+    """Prediksi harian utama (1, 5, 21 hari) terbaru: hasil rekonsiliasi kalau ada, kalau tidak ensemble."""
+    out = {}
+    ens = store.latest_predictions("ensemble")
+    rec = store.latest_predictions("recon")
+    for h in HORIZONS.values():
+        e = ens[(ens.asset == asset) & (ens.horizon == h)] if len(ens) else ens
+        r = rec[(rec.asset == asset) & (rec.horizon == h)] if len(rec) else rec
+        if len(r) and (not len(e) or r.base_date.iloc[0] >= e.base_date.iloc[0]):
+            out[h] = r.iloc[0]
+        elif len(e):
+            out[h] = e.iloc[0]
+    return out
+
+
+def _direction(row) -> int:
+    if row.p_up >= 0.55 and row.q50 > 0:
+        return 1
+    if row.p_up <= 0.45 and row.q50 < 0:
+        return -1
+    return 0
+
+
+def _conflict(main: dict, horizon: int) -> str:
+    """Teks penjelasan kalau rentang lain jelas berlawanan arah dengan rentang ini."""
+    if horizon not in main:
+        return ""
+    mine = _direction(main[horizon])
+    if not mine:
+        return ""
+    name = {v: k for k, v in HORIZONS.items()}
+    opp = [name[h] for h, r in main.items() if h != horizon and _direction(r) == -mine]
+    if not opp:
+        return ""
+    return f"{name.get(horizon, horizon)} {'naik' if mine > 0 else 'turun'}, {' dan '.join(opp)} {'turun' if mine > 0 else 'naik'}"
+
+
 def summarize(store: Store, asset: str, timeframe: str, cd: pd.DataFrame | None = None) -> Summary:
     a = ASSET_BY_KEY[asset]
     tf = TIMEFRAMES[timeframe]
@@ -365,9 +424,14 @@ def summarize(store: Store, asset: str, timeframe: str, cd: pd.DataFrame | None 
     bt = store.backtests()
     ev = store.evaluated(asset, horizon, tf.model)
     s.past = ev
+    main = {} if tf.intraday else main_rows(store, asset)
 
     if len(row):
         r = row.iloc[0]
+        fund_version = str(r.get("model_version") or "")
+        if horizon in main and main[horizon].model == "recon":
+            r = main[horizon]
+            s.reconciled = "used=1" in str(r.model_version)
         s.has_prediction = True
         s.as_of = r.base_date
         s.last_price = r.base_price
@@ -376,10 +440,13 @@ def summarize(store: Store, asset: str, timeframe: str, cd: pd.DataFrame | None 
         s.high = r.base_price * math.exp(r.q90)
         s.change_pct = math.exp(r.q50) - 1
         s.p_up = float(r.p_up)
-        m = re.search(r"fund_shift=([+-][0-9.]+)", str(r.get("model_version") or ""))
+        m = re.search(r"fund_shift=([+-][0-9.]+)", fund_version)
         s.fund_shift = float(m.group(1)) if m else 0.0
         s.proven = is_proven(bt, asset, horizon, bt_model, bt_naive)
         s.signal = signal(s.p_up, r.q50) if s.proven else "TAHAN"
+        s.conflict = _conflict(main, horizon)
+        if s.conflict and s.signal != "TAHAN":
+            s.signal = "TAHAN"  # arah antar-rentang bertentangan: jangan beri saran beli/jual
         s.target_date = _target(tf, r.base_date)
         arrow = "▲ naik" if s.change_pct > 0 else "▼ turun" if s.change_pct < 0 else "tetap"
         s.lines["headline"] = f"Perkiraan harga {_horizon_text(tf)}"
@@ -389,6 +456,8 @@ def summarize(store: Store, asset: str, timeframe: str, cd: pd.DataFrame | None 
                             f"{money(s.low, a.currency)} dan {money(s.high, a.currency)}.")
         s.lines["p_up"] = f"Peluang naik {pct(s.p_up)}: {_lean(s.p_up)}."
         s.lines["signal"] = _signal_text(s.signal, s.proven)
+        if s.conflict:
+            s.lines["signal"] = f"Arah antar-rentang bertentangan ({s.conflict}), jadi belum ada saran beli/jual."
         when = pd.Timestamp(r.base_date).strftime("%d %b %Y %H:%M" if tf.intraday else "%d %b %Y")
         s.lines["as_of"] = (f"Berdasarkan harga batang {when}." if tf.intraday
                             else f"Berdasarkan harga penutupan {when}.")
@@ -426,6 +495,18 @@ def summarize(store: Store, asset: str, timeframe: str, cd: pd.DataFrame | None 
             s.reliability, s.reliability_level = "Sedang", 2
         else:
             s.reliability, s.reliability_level = "Rendah", 1
+
+    if s.conflict and s.reliability_level > 1:
+        s.reliability_level -= 1
+        s.reliability = {1: "Rendah", 2: "Sedang"}[s.reliability_level]
+    rec = store.reconcile_stats(asset) if not tf.intraday else pd.DataFrame()
+    rec_h = rec[rec.horizon == horizon] if len(rec) else rec
+    if len(rec_h) and bool(rec_h.used.iloc[0]):
+        rr = rec_h.iloc[0]
+        s.lines["recon"] = (f"Diselaraskan dengan rentang lain: di uji data lama galat {dec(rr.mae_recon * 100)}% vs "
+                            f"{dec(rr.mae_direct * 100)}% tanpa penyelarasan, arah benar {pct(rr.hit_recon)} vs {pct(rr.hit_direct)}.")
+    elif len(rec_h):
+        s.lines["recon"] = "Penyelarasan antar-rentang tidak dipakai di sini karena tidak lebih akurat di uji data lama."
 
     s.ta = detect(cd, money=lambda v: money(v, a.currency)) if cd is not None and not cd.empty else None
     s.path = forecast_path(store, asset, s.path_key)
@@ -472,3 +553,66 @@ def asset_list(store: Store, timeframe: str) -> list[dict]:
                 item["price"] = float(last.iloc[-1])
         out.append(item)
     return out
+
+
+def confidence(p_up: float, hit: float | None, conflict: bool = False,
+               change: float | None = None) -> tuple[str, int]:
+    """Tingkat keyakinan satu titik prediksi: (label, level 1–3).
+
+    Menggabungkan seberapa yakin model soal arah (peluang arah yang diperkirakan) dengan rekam jejak
+    model di rentang itu pada uji data lama.
+    """
+    dir_prob = max(p_up, 1 - p_up)
+    if hit is None or pd.isna(hit):
+        return "Belum teruji", 0
+    skill = hit - 0.5
+    disagree = change is not None and change != 0 and (change > 0) != (p_up > 0.5)
+    if dir_prob < 0.55 or skill <= 0.01 or disagree:  # median dan peluang tidak sepakat arah = ragu
+        level = 1
+    elif dir_prob >= 0.60 and skill >= 0.04:
+        level = 3
+    else:
+        level = 2
+    if conflict:
+        level = min(level, 2)
+    return {1: "Rendah", 2: "Sedang", 3: "Tinggi"}[level], level
+
+
+def forecast_table(store: Store, asset: str, timeframe: str) -> pd.DataFrame:
+    """Tabel prediksi untuk tampilan tabel: satu baris per titik ke depan."""
+    tf = TIMEFRAMES[timeframe]
+    path = forecast_path(store, asset, tf.path_key or "harian")
+    if path.empty:
+        return path
+    base = path.attrs["base_price"]
+    bt = store.backtests()
+    hits: dict[float, float] = {}
+    if tf.intraday:
+        sel = bt[(bt.asset == asset) & (bt.model == f"{tf.model}_lgbm")] if len(bt) else bt
+        if len(sel):
+            hits = {0.0: float(sel.hit_rate.iloc[0])}
+    else:
+        rec = store.reconcile_stats(asset)
+        for r in rec.itertuples():
+            hits[float(r.horizon)] = r.hit_recon if r.used else r.hit_direct
+        if not hits and len(bt):  # belum ada rekonsiliasi: pakai backtest model utama
+            sel = bt[(bt.asset == asset) & (bt.model == "lightgbm")]
+            hits = {float(r.horizon): r.hit_rate for r in sel.itertuples()}
+    main = {} if tf.intraday else main_rows(store, asset)
+    conflict = any(_conflict(main, h) for h in main)
+    rows = []
+    for r in path.itertuples():
+        hit = hits[min(hits, key=lambda k: abs(k - r.h))] if hits else None
+        label, level = confidence(r.p_up, hit, conflict, r.mid / base - 1)
+        up = r.p_up >= 0.5
+        rows.append({
+            "date": r.date, "h": r.h, "mid": r.mid, "lo": r.lo, "hi": r.hi, "change": r.mid / base - 1,
+            "p_up": r.p_up, "confidence": label, "level": level,
+            "why": (f"Peluang arah {'naik' if up else 'turun'} {pct(max(r.p_up, 1 - r.p_up))}"
+                    + (f"; di uji data lama arah benar {pct(hit)}" if hit is not None else "")
+                    + ("; arah antar-rentang bertentangan" if conflict else "")
+                    + ("; median dan peluang tidak sepakat arah" if (r.mid > base) != up else "") + "."),
+        })
+    df = pd.DataFrame(rows)
+    df.attrs.update(path.attrs)
+    return df
